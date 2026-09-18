@@ -45,13 +45,14 @@
     "test": "vitest run",
     "demo": "tsx examples/demo.ts",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
+    "validate:manifests": "node scripts/validate-manifests.mjs",
     "validate:plugin": "claude plugin validate .claude-plugin/plugin.json",
     "check": "npm run typecheck && npm test && npm run build",
     "prepack": "npm run check",
     "pack:check": "npm pack --dry-run",
     "smoke:pack": "node scripts/pack-smoke-test.mjs",
     "version:check": "node scripts/check-version-sync.mjs",
-    "release:check": "npm run check && npm run validate:plugin && npm run pack:check && npm run smoke:pack"
+    "release:check": "npm run check && npm run validate:manifests && npm run pack:check && npm run smoke:pack"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.31",

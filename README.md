@@ -110,6 +110,8 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `maxConcurrentRequests` | `3` | Maximum concurrent HTTP requests to Jev when asking question batches |
+| `requestTimeoutMs` | `15000` | HTTP request timeout in milliseconds before aborting a Jev request |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting
@@ -204,13 +206,15 @@ With options (every value also falls back to its default when omitted):
 
 `apiKey` defaults to `process.env.TYPESAFE_API_KEY`. All library options
 (`goal`, `keepThreshold`, `preserveRecentMessages`, `maxStateTokens`,
-`maxRequestTokens`, `truncateHeadChars`, plus `model`/`baseUrl`) behave as
+`maxRequestTokens`, `truncateHeadChars`, `maxConcurrentRequests`, `requestTimeoutMs`, plus `model`/`baseUrl`) behave as
 documented above.
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `enabled` | `true` | Set to `false` to keep the plugin loaded but skip Jev pruning |
 | `minReductionRatio` | `0` | Minimum estimated char reduction required to apply pruning to a request |
+| `maxConcurrentRequests` | `3` | Maximum concurrent HTTP requests to Jev across question batches |
+| `requestTimeoutMs` | `15000` | Timeout in milliseconds for Jev API requests before falling back gracefully |
 | `debugFile` | `FAST_JEV_DEBUG_FILE` | Path of a JSONL file receiving one stats-only line per hook invocation (counts and decisions, never message content); proves the plugin is firing and pruning in a live session |
 
 Failures (missing key, Jev error, oversized history) are logged with

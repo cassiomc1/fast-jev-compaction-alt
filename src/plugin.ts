@@ -39,14 +39,10 @@ type AppLog = (input: {
   };
 }) => Promise<unknown>;
 
-function compactOptionsOf(config: {
-  goal?: string;
-  keepThreshold: number;
-  preserveRecentMessages: number;
-  maxStateTokens: number;
-  maxRequestTokens: number;
-  truncateHeadChars: number;
-}): CompactOptions {
+function compactOptionsOf(
+  config: ResolvedOpenCodeConfig,
+  pinnedToolUseIds?: ReadonlySet<string>,
+): CompactOptions {
   return {
     goal: config.goal,
     keepThreshold: config.keepThreshold,
@@ -54,6 +50,9 @@ function compactOptionsOf(config: {
     maxStateTokens: config.maxStateTokens,
     maxRequestTokens: config.maxRequestTokens,
     truncateHeadChars: config.truncateHeadChars,
+    maxConcurrentRequests: config.maxConcurrentRequests,
+    requestTimeoutMs: config.requestTimeoutMs,
+    ...(pinnedToolUseIds ? { pinnedToolUseIds } : {}),
   };
 }
 
@@ -177,7 +176,6 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
     partsTruncated: 0,
     messagesDropped: 0,
     charsSaved: 0,
-    tokensSaved: 0,
   };
 
   // System guidance lines keyed by session ID so concurrent sessions never leak context.
@@ -297,8 +295,13 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           apiKey: config.apiKey,
           model: config.model,
           baseUrl: config.baseUrl,
+          requestTimeoutMs: config.requestTimeoutMs,
         });
-        const rawResult = await compact(libMessages, asker, compactOptionsOf(config));
+        const rawResult = await compact(
+          libMessages,
+          asker,
+          compactOptionsOf(config, testErrorCallIDs),
+        );
         const biasedResult = applyHostPolicies(messages, calls, rawResult, config);
 
         if (reductionRatio(biasedResult) < config.minReductionRatio) {
@@ -320,6 +323,7 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           partsDropped: 0,
           partsTruncated: 0,
           messagesDropped: 0,
+          truncatedCallIDs: new Set<string>(),
         };
         const next = applyDecisionsToOpenCode(
           messages,
@@ -351,7 +355,6 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
         cumulativeStats.partsTruncated += stats.partsTruncated;
         cumulativeStats.messagesDropped += stats.messagesDropped;
         cumulativeStats.charsSaved += saved;
-        cumulativeStats.tokensSaved += saved;
 
         // Store for the system prompt hook.
         guidanceBySession.set(
@@ -405,9 +408,12 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
       const sessionKey =
         (input as { sessionID?: string })?.sessionID ?? '__default__';
       const guidance = guidanceBySession.get(sessionKey);
-      if (guidance && guidance.length > 0) {
-        for (const line of guidance) {
-          output.system.push(line);
+      if (guidance?.length) {
+        const block = guidance.join('\n');
+        if (output.system.length === 0) {
+          output.system.push(block);
+        } else {
+          output.system[0] = `${output.system[0]}\n${block}`;
         }
         guidanceBySession.delete(sessionKey);
       }
@@ -468,8 +474,13 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           apiKey: config.apiKey,
           model: config.model,
           baseUrl: config.baseUrl,
+          requestTimeoutMs: config.requestTimeoutMs,
         });
-        const rawResult = await compact(libMessages, asker, compactOptionsOf(config));
+        const rawResult = await compact(
+          libMessages,
+          asker,
+          compactOptionsOf(config, testErrorCallIDs),
+        );
         const biasedResult = applyHostPolicies(entries, calls, rawResult, config);
         for (const line of compactionContext(biasedResult)) output.context.push(line);
         await note({
@@ -504,7 +515,7 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
     tool: {
       jev_compaction_status: tool({
         description:
-          'Check whether fast-jev-compaction (Jev-guided verbatim context pruning) is active in this session. Returns the plugin configuration, tool weight biases, the last 5 pruning runs, and cumulative stats (total parts dropped, tokens saved). Call it when the user asks if Jev compaction is enabled, working, or wants pruning stats.',
+          'Check whether fast-jev-compaction (Jev-guided verbatim context pruning) is active in this session. Returns the plugin configuration, tool weight biases, the last 5 pruning runs, and cumulative stats (total parts dropped, characters saved). Call it when the user asks if Jev compaction is enabled, working, or wants pruning stats.',
         args: {},
         execute: async () => statusSnapshot(),
       }),

@@ -27,7 +27,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
-const MIN_QUESTION_BUDGET = 50;
+const MIN_QUESTION_BUDGET = 150;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -40,22 +40,27 @@ function clamp01(value: number): number {
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
   const maxRequestTokens = Math.max(
     1,
-    finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+    Math.floor(finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens)),
   );
-  if (maxRequestTokens <= REQUEST_OVERHEAD_TOKENS) {
-    throw new Error('maxRequestTokens is too small');
+  const minRequiredRequest = REQUEST_OVERHEAD_TOKENS + MIN_QUESTION_BUDGET + 1;
+  if (maxRequestTokens < minRequiredRequest) {
+    throw new Error(
+      `maxRequestTokens must be at least ${minRequiredRequest} to leave room for overhead and question budget`,
+    );
   }
-  if (
-    options.maxStateTokens !== undefined &&
-    options.maxRequestTokens !== undefined &&
-    options.maxStateTokens > options.maxRequestTokens - REQUEST_OVERHEAD_TOKENS - MIN_QUESTION_BUDGET
-  ) {
-    throw new Error('maxStateTokens must leave room for at least one Jev question batch');
-  }
-  const maxStateTokens = Math.min(
-    Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    Math.max(1, maxRequestTokens - REQUEST_OVERHEAD_TOKENS - 1),
+
+  const safeMaxStateTokens = maxRequestTokens - REQUEST_OVERHEAD_TOKENS - MIN_QUESTION_BUDGET;
+  const requestedStateTokens = Math.max(
+    1,
+    Math.floor(finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
   );
+  const maxStateTokens = Math.min(requestedStateTokens, safeMaxStateTokens);
+
+  const pinnedToolUseIds = options.pinnedToolUseIds
+    ? options.pinnedToolUseIds instanceof Set
+      ? options.pinnedToolUseIds
+      : new Set(options.pinnedToolUseIds)
+    : undefined;
 
   return {
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
@@ -82,6 +87,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       1,
       finite(options.requestTimeoutMs, DEFAULT_OPTIONS.requestTimeoutMs),
     ),
+    ...(pinnedToolUseIds ? { pinnedToolUseIds } : {}),
   };
 }
 
@@ -307,6 +313,27 @@ export function resultFromDecisions(
     calls,
     truncateHeadChars,
   );
+
+  const originalResults = new Map<string, string>();
+  for (const m of messages) {
+    for (const r of m.toolResults ?? []) originalResults.set(r.tool_use_id, r.text);
+    for (const t of m.toolUses) if (t.text !== undefined) originalResults.set(t.tool_use_id, t.text);
+  }
+  const keptResults = new Map<string, string>();
+  for (const m of kept) {
+    for (const r of m.toolResults ?? []) keptResults.set(r.tool_use_id, r.text);
+    for (const t of m.toolUses) if (t.text !== undefined) keptResults.set(t.tool_use_id, t.text);
+  }
+  let resultsTruncated = 0;
+  for (const [id, originalText] of originalResults) {
+    const keptText = keptResults.get(id);
+    if (keptText !== undefined && keptText !== originalText) {
+      resultsTruncated++;
+    }
+  }
+
+  const resultsMarkedStale = count(decisions, 'result_dropped');
+
   return {
     messages: kept,
     decisions: [...decisions],
@@ -320,7 +347,9 @@ export function resultFromDecisions(
       ),
       calls: calls.length,
       kept: count(decisions, 'kept'),
-      resultsDropped: count(decisions, 'result_dropped'),
+      resultsDropped: resultsMarkedStale,
+      resultsTruncated,
+      resultsMarkedStale,
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
       ...inherited,
@@ -333,22 +362,22 @@ export function resultFromDecisions(
  */
 export async function mapConcurrent<T, R>(
   items: readonly T[],
-  concurrency: number,
+  limit: number,
   fn: (item: T) => Promise<R>,
 ): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
+  if (items.length === 0) return [];
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
 
   async function worker() {
-    while (true) {
-      const index = next++;
-      if (index >= items.length) return;
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
       results[index] = await fn(items[index]!);
     }
   }
 
-  const workerCount = Math.min(Math.max(1, concurrency), items.length);
-  await Promise.all(Array.from({ length: workerCount }, worker));
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
 }
 
@@ -366,7 +395,11 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
-  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
+  const calls = collectToolCalls(
+    messages,
+    resolved.preserveRecentMessages,
+    resolved.pinnedToolUseIds,
+  );
   const candidates = calls.filter((call) => !call.pinned);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };

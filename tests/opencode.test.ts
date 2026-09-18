@@ -89,11 +89,28 @@ describe('resolveOpenCodeConfig', () => {
       minReductionRatio: 0,
       enabled: true,
       apiKey: undefined,
+      maxConcurrentRequests: 3,
+      requestTimeoutMs: 15_000,
     });
     expect(
-      resolveOpenCodeConfig({ apiKey: 'k', model: 'jev-x', enabled: false }, { TYPESAFE_API_KEY: 'env' }),
-    ).toMatchObject({ apiKey: 'k', model: 'jev-x', enabled: false });
+      resolveOpenCodeConfig(
+        { apiKey: 'k', model: 'jev-x', enabled: false, maxConcurrentRequests: 2, requestTimeoutMs: 5000 },
+        { TYPESAFE_API_KEY: 'env' },
+      ),
+    ).toMatchObject({ apiKey: 'k', model: 'jev-x', enabled: false, maxConcurrentRequests: 2, requestTimeoutMs: 5000 });
     expect(resolveOpenCodeConfig({}, { TYPESAFE_API_KEY: 'env' }).apiKey).toBe('env');
+  });
+
+  it('parses FAST_JEV_MAX_CONCURRENT_REQUESTS and FAST_JEV_REQUEST_TIMEOUT_MS from env (Finding 3)', () => {
+    const config = resolveOpenCodeConfig(
+      {},
+      {
+        FAST_JEV_MAX_CONCURRENT_REQUESTS: '5',
+        FAST_JEV_REQUEST_TIMEOUT_MS: '8000',
+      },
+    );
+    expect(config.maxConcurrentRequests).toBe(5);
+    expect(config.requestTimeoutMs).toBe(8000);
   });
 });
 
@@ -590,6 +607,11 @@ describe('jev_compaction_status tool', () => {
     const cum = status.cumulativeStats as Record<string, number>;
     expect(cum.runs).toBe(2);
     expect(cum.partsDropped).toBeGreaterThan(0);
+    expect(cum.charsSaved).toBeGreaterThan(0);
+    expect('tokensSaved' in cum).toBe(false);
+    expect(JSON.stringify(status)).not.toContain('tokensSaved');
+    expect(statusTool?.description).toContain('characters saved');
+    expect(statusTool?.description).not.toContain('tokens saved');
   });
 });
 
@@ -771,6 +793,35 @@ describe('system prompt hook', () => {
     expect(systemOutput.system.length).toBeGreaterThan(0);
     expect(systemOutput.system.join('\n')).toContain('[fast-jev-compaction]');
     expect(systemOutput.system.join('\n')).toContain('pruned');
+  });
+
+  it('appends guidance to existing system prompt preserving single block (Finding 2)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch((name) => {
+        if (name === 'call_t1' || name === 'result_t1') return 0.9;
+        if (name === 'call_t2') return 0.9;
+        return 0.1;
+      }),
+    );
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1 } as never,
+    );
+    const entries = transcript();
+    await hooks['experimental.chat.messages.transform']!(
+      {} as never,
+      { messages: entries as unknown[] } as never,
+    );
+    const systemOutput = { system: ['You are a helpful assistant.'] };
+    await hooks['experimental.chat.system.transform']!(
+      {} as never,
+      systemOutput as never,
+    );
+    expect(systemOutput.system).toHaveLength(1);
+    expect(systemOutput.system[0]).toContain('You are a helpful assistant.');
+    expect(systemOutput.system[0]).toContain('[fast-jev-compaction]');
   });
 
   it('injects nothing when there was no pruning', async () => {
@@ -1002,5 +1053,146 @@ describe('plugin session handling and isolation', () => {
       outputASecond as never,
     );
     expect(outputASecond.system).toEqual([]);
+  });
+});
+
+describe('plugin timeout enforcement and error pinning (Findings 3, 4, 5)', () => {
+  it('enforces requestTimeoutMs and aborts cleanly in messages.transform (Finding 4)', async () => {
+    vi.stubGlobal('fetch', async (_url: string, init?: { signal?: AbortSignal }) => {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          resolve({
+            status: 200,
+            ok: true,
+            text: async () => JSON.stringify({ answers: {} }),
+          } as unknown as Response);
+        }, 150);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    });
+
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1, requestTimeoutMs: 25 } as never,
+    );
+    const entries = transcript();
+    const originalJson = JSON.stringify(entries);
+    const output = { messages: entries as unknown[] };
+
+    await hooks['experimental.chat.messages.transform']!(
+      {} as never,
+      output as never,
+    );
+
+    // Messages must remain completely intact (graceful fallback)
+    expect(JSON.stringify(output.messages)).toBe(originalJson);
+    const timeoutLog = logged.find((entry) =>
+      JSON.stringify(entry).includes('pruning skipped') &&
+      (JSON.stringify(entry).includes('aborted') || JSON.stringify(entry).includes('timeout')),
+    );
+    expect(timeoutLog).toBeDefined();
+  });
+
+  it('enforces requestTimeoutMs and adds fallback guidance in session.compacting (Finding 4)', async () => {
+    vi.stubGlobal('fetch', async (_url: string, init?: { signal?: AbortSignal }) => {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          resolve({
+            status: 200,
+            ok: true,
+            text: async () => JSON.stringify({ answers: {} }),
+          } as unknown as Response);
+        }, 150);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    });
+
+    const logged: unknown[] = [];
+    const sessionEntries = transcript();
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged, sessionEntries) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1, requestTimeoutMs: 25 } as never,
+    );
+    const output = { context: [] as string[] };
+
+    await hooks['experimental.session.compacting']!(
+      { sessionID: 'sess-timeout' } as never,
+      output as never,
+    );
+
+    expect(output.context.length).toBeGreaterThan(0);
+    expect(output.context[0]).toContain(COMPACTION_FALLBACK_GUIDANCE);
+    const timeoutLog = logged.find((entry) =>
+      JSON.stringify(entry).includes('compacting guidance fell back') &&
+      (JSON.stringify(entry).includes('aborted') || JSON.stringify(entry).includes('timeout')),
+    );
+    expect(timeoutLog).toBeDefined();
+  });
+
+  it('pins failing test commands so they are never sent to Jev as candidate questions (Finding 5)', async () => {
+    const askedQuestions: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      async (_url: string, init?: { body?: string }) => {
+        const parsed = JSON.parse(init?.body ?? '{}') as { questions?: Record<string, unknown> };
+        const questions = parsed.questions ?? {};
+        askedQuestions.push(...Object.keys(questions));
+        const answers = Object.fromEntries(
+          Object.keys(questions).map((k) => [
+            k,
+            { type: 'noul', noul: k.startsWith('call_') ? 0.9 : 0.01 },
+          ]),
+        );
+        return {
+          status: 200,
+          ok: true,
+          text: async () => JSON.stringify({ answers }),
+        } as unknown as Response;
+      },
+    );
+
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 0, keepThreshold: 0.5 } as never,
+    );
+
+    const failingTestOutput = 'FAIL src/math.test.ts\nExpected 4, received 5\nexit code 1';
+    const entries: OpenCodeMessageWithParts[] = [
+      textEntry('user', 'Fix the test failure'),
+      toolEntry('call-fail-test', 'Bash', { command: 'npm test' }, failingTestOutput, 'error'),
+      toolEntry('call-read-code', 'Read', { file_path: 'src/math.ts' }, fileA, 'completed'),
+      textEntry('user', 'continue'),
+    ];
+
+    const output = { messages: entries as unknown[] };
+    await hooks['experimental.chat.messages.transform']!(
+      {} as never,
+      output as never,
+    );
+
+    // 1. Failing test call/result must NEVER be sent as a question to Jev
+    expect(askedQuestions).not.toContain('call_t1');
+    expect(askedQuestions).not.toContain('result_t1');
+    expect(askedQuestions).toContain('call_t2');
+    expect(askedQuestions).toContain('result_t2');
+
+    // 2. The failing test output remains completely intact and verbatim in messages
+    const transformed = output.messages as OpenCodeMessageWithParts[];
+    const testToolPart = transformed[1]?.parts[0] as OpenCodePart;
+    expect(testToolPart.state?.status).toBe('error');
+    expect((testToolPart.state as { error?: string })?.error).toBe(failingTestOutput);
+
+    // 3. Read call was unpinned and dropped/truncated because keepThreshold=0.99 > 0.01
+    const readToolPart = transformed[2]?.parts[0] as OpenCodePart;
+    expect(readToolPart.state?.status).toBe('completed');
+    expect((readToolPart.state as { output?: string })?.output).toContain('[fast-jev-compaction truncated');
   });
 });

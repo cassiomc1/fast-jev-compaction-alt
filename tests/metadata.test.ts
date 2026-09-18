@@ -75,7 +75,18 @@ describe('Metadata consistency', () => {
     expect(cfg.maxStateTokens.default).toBe(DEFAULT_OPTIONS.maxStateTokens);
     expect(cfg.maxRequestTokens.default).toBe(DEFAULT_OPTIONS.maxRequestTokens);
     expect(cfg.truncateHeadChars.default).toBe(DEFAULT_OPTIONS.truncateHeadChars);
+    expect(cfg.maxConcurrentRequests.default).toBe(DEFAULT_OPTIONS.maxConcurrentRequests);
     expect(cfg.compactAtPercent.default).toBe(HOOK_DEFAULTS.compactAtPercent);
     expect(cfg.minReductionRatio.default).toBe(HOOK_DEFAULTS.minReductionRatio);
+  });
+
+  it('plugin.json userConfig uses min and max instead of minimum and maximum', () => {
+    const pluginJson = readJson('.claude-plugin/plugin.json');
+    for (const [key, field] of Object.entries(pluginJson.userConfig as Record<string, Record<string, unknown>>)) {
+      expect(field).not.toHaveProperty('minimum');
+      expect(field).not.toHaveProperty('maximum');
+      if ('min' in field) expect(typeof field.min).toBe('number');
+      if ('max' in field) expect(typeof field.max).toBe('number');
+    }
   });
 });

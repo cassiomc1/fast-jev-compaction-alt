@@ -13,12 +13,14 @@ import {
   parseJevResponse,
   reductionRatio,
   resolveOptions,
+  resultFromDecisions,
   type HistoryToolCall,
   type JevAsker,
   type JevQuestions,
   type Message,
   type ToolCall,
 } from '../src/index.js';
+import { decisionSummary } from '../src/opencode.js';
 
 function message(role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
   return { role, text, toolUses: [], ...extra };
@@ -91,10 +93,29 @@ describe('options', () => {
     });
     expect(resolveOptions({ keepThreshold: -0.5 }).keepThreshold).toBe(0);
     expect(resolveOptions({ keepThreshold: 1.8 }).keepThreshold).toBe(1);
-    expect(() => resolveOptions({ maxRequestTokens: 10 })).toThrow(/maxRequestTokens is too small/);
-    expect(() => resolveOptions({ maxStateTokens: 1000, maxRequestTokens: 1000 })).toThrow(
-      /maxStateTokens must leave room/,
-    );
+    expect(() => resolveOptions({ maxRequestTokens: 10 })).toThrow(/maxRequestTokens must be at least/);
+
+    // Finding 1 regression tests:
+    const calls = collectToolCalls(transcript(), 0);
+
+    // 1. maxRequestTokens: 1000 clamps maxStateTokens to safe budget (1000 - 20 - 150 = 830)
+    const optReq1000 = resolveOptions({ maxRequestTokens: 1000 });
+    expect(optReq1000.maxRequestTokens).toBe(1000);
+    expect(optReq1000.maxStateTokens).toBe(830);
+    expect(() => batchCalls([calls[0]!], optReq1000.maxStateTokens, optReq1000)).not.toThrow();
+    expect(batchCalls([calls[0]!], optReq1000.maxStateTokens, optReq1000).length).toBeGreaterThanOrEqual(1);
+
+    // 2. maxStateTokens: 1000 with default maxRequestTokens (30,000)
+    const optState1000 = resolveOptions({ maxStateTokens: 1000 });
+    expect(optState1000.maxStateTokens).toBe(1000);
+    expect(optState1000.maxRequestTokens).toBe(30_000);
+    expect(() => batchCalls([calls[0]!], optState1000.maxStateTokens, optState1000)).not.toThrow();
+
+    // 3. maxStateTokens: 950, maxRequestTokens: 1000 clamps maxStateTokens safely to 830
+    const opt950_1000 = resolveOptions({ maxStateTokens: 950, maxRequestTokens: 1000 });
+    expect(opt950_1000.maxRequestTokens).toBe(1000);
+    expect(opt950_1000.maxStateTokens).toBe(830);
+    expect(() => batchCalls([calls[0]!], opt950_1000.maxStateTokens, opt950_1000)).not.toThrow();
   });
 });
 
@@ -371,6 +392,59 @@ describe('decisions', () => {
     const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
     const out = applyDecisions(messages, decisions, calls, 50);
     expect(out[2]?.toolResults?.[0]?.text).toBe('short');
+  });
+
+  describe('resultFromDecisions and decisionSummary mutation tracking (Finding 6)', () => {
+    const inherited = { stateTokens: 100, stateStage: 'full', requests: 1, ms: 10 };
+
+    it('Case A: does not count short results as truncated when left unchanged', () => {
+      const messages = [
+        message('user', 'initial prompt'),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'short' }] }),
+      ];
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+      const res = resultFromDecisions(messages, calls, decisions, 50, inherited);
+      expect(res.stats.resultsTruncated).toBe(0);
+      expect(res.stats.resultsMarkedStale).toBe(1);
+      expect(res.stats.resultsDropped).toBe(1);
+      expect(decisionSummary(res)).not.toMatch(/results truncated/);
+    });
+
+    it('Case B: counts long results as truncated when actually modified', () => {
+      const messages = [
+        message('user', 'initial prompt'),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'long '.repeat(100) }] }),
+      ];
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+      const res = resultFromDecisions(messages, calls, decisions, 50, inherited);
+      expect(res.stats.resultsTruncated).toBe(1);
+      expect(res.stats.resultsMarkedStale).toBe(1);
+      expect(decisionSummary(res)).toMatch(/1 results truncated/);
+    });
+
+    it('Case C: counts only actually modified results in mixed transcripts (1 short + 1 long -> 1)', () => {
+      const messages = [
+        message('user', 'initial prompt'),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'short' }] }),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-2', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-2', text: 'long '.repeat(100) }] }),
+      ];
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [
+        decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
+        decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
+      ];
+      const res = resultFromDecisions(messages, calls, decisions, 50, inherited);
+      expect(res.stats.resultsTruncated).toBe(1);
+      expect(res.stats.resultsMarkedStale).toBe(2);
+      expect(res.stats.resultsDropped).toBe(2);
+      expect(decisionSummary(res)).toMatch(/1 results truncated/);
+    });
   });
 });
 

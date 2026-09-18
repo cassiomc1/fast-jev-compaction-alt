@@ -111,6 +111,8 @@ export interface ResolvedOpenCodeConfig {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  maxConcurrentRequests: number;
+  requestTimeoutMs: number;
   minReductionRatio: number;
   enabled: boolean;
   debugFile?: string;
@@ -202,6 +204,28 @@ export function resolveOpenCodeConfig(
       0,
       Math.floor(finite(options.truncateHeadChars, OPENCODE_DEFAULTS.truncateHeadChars)),
     ),
+    maxConcurrentRequests: Math.max(
+      1,
+      Math.floor(
+        finite(
+          options.maxConcurrentRequests ??
+            (e['FAST_JEV_MAX_CONCURRENT_REQUESTS']
+              ? Number(e['FAST_JEV_MAX_CONCURRENT_REQUESTS'])
+              : undefined),
+          OPENCODE_DEFAULTS.maxConcurrentRequests,
+        ),
+      ),
+    ),
+    requestTimeoutMs: Math.max(
+      1,
+      finite(
+        options.requestTimeoutMs ??
+          (e['FAST_JEV_REQUEST_TIMEOUT_MS']
+            ? Number(e['FAST_JEV_REQUEST_TIMEOUT_MS'])
+            : undefined),
+        OPENCODE_DEFAULTS.requestTimeoutMs,
+      ),
+    ),
     minReductionRatio: clamp01(finite(options.minReductionRatio, OPENCODE_DEFAULTS.minReductionRatio)),
     enabled: options.enabled ?? OPENCODE_DEFAULTS.enabled,
     debugFile,
@@ -286,6 +310,7 @@ export interface ApplyToOpenCodeStats {
   partsDropped: number;
   partsTruncated: number;
   messagesDropped: number;
+  truncatedCallIDs?: Set<string>;
 }
 
 /**
@@ -340,7 +365,10 @@ export function applyDecisionsToOpenCode(
           if (truncated !== text) {
             if (part.state.status === 'completed') part.state.output = truncated;
             else if (part.state.status === 'error') part.state.error = truncated;
-            if (statsOut) statsOut.partsTruncated += 1;
+            if (statsOut) {
+              statsOut.partsTruncated += 1;
+              statsOut.truncatedCallIDs?.add(part.callID);
+            }
           }
         }
       }
@@ -360,9 +388,10 @@ export function applyDecisionsToOpenCode(
 /** One-line human summary of a compaction result, shared by both hosts. */
 export function decisionSummary(result: CompactResult): string {
   const { stats } = result;
+  const truncated = stats.resultsTruncated ?? stats.resultsDropped;
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
-    stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
+    truncated > 0 ? `${truncated} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} calls dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
@@ -487,15 +516,20 @@ export function pruningSystemGuidance(
   const lines: string[] = [
     '[fast-jev-compaction] Some older tool outputs in this conversation were pruned to save context:',
   ];
-  const truncated = result.decisions.filter((d) => d.action === 'drop_result');
+  const truncated = stats.truncatedCallIDs
+    ? result.decisions.filter(
+        (d) => d.action === 'drop_result' && d.tool_use_id && stats.truncatedCallIDs!.has(d.tool_use_id),
+      )
+    : result.decisions.filter((d) => d.action === 'drop_result');
   const dropped = result.decisions.filter((d) => d.action === 'drop_call');
-  if (truncated.length > 0) {
+  if (stats.partsTruncated > 0) {
     const preserved =
       truncateHeadChars === 0
         ? 'result body removed; only a truncation note remains'
         : `only first ~${truncateHeadChars} chars kept`;
+    const toolList = truncated.length > 0 ? `: ${truncated.map((d) => `${d.tool}[${d.id}]`).join(', ')}` : '';
     lines.push(
-      `- ${truncated.length} tool result(s) truncated (${preserved}): ${truncated.map((d) => `${d.tool}[${d.id}]`).join(', ')}`,
+      `- ${stats.partsTruncated} tool result(s) truncated (${preserved})${toolList}`,
     );
   }
   if (dropped.length > 0) {

@@ -63,6 +63,7 @@ export function isPinned(
 export function collectToolCalls(
   messages: readonly Message[],
   preserveRecentMessages: number,
+  pinnedToolUseIds?: ReadonlySet<string>,
 ): ToolCall[] {
   const results = new Map<string, { index: number; result: ToolResult }>();
   messages.forEach((message, index) => {
@@ -86,7 +87,8 @@ export function collectToolCalls(
         isError: found.result.isError ?? false,
         pinned:
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
-          isPinned(found.index, messages.length, preserveRecentMessages),
+          isPinned(found.index, messages.length, preserveRecentMessages) ||
+          (pinnedToolUseIds?.has(tool.tool_use_id) ?? false),
       });
     }
   });

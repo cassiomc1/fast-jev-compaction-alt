@@ -30,6 +30,9 @@ jobs:
       - name: Check version and metadata synchronization
         run: npm run version:check
 
+      - name: Validate plugin and marketplace manifests
+        run: npm run validate:manifests
+
       - name: Typecheck
         run: npm run typecheck
 
