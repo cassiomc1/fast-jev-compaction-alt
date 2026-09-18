@@ -77,7 +77,7 @@ async function debugLine(debugFile: string | undefined, line: Record<string, unk
  * 2. Applies per-tool score weights (biases).
  * 3. Recomputes final decisions, message transcripts, and stats via `resultFromDecisions`.
  */
-export function applyHostPolicies(
+function applyHostPolicies(
   entries: readonly OpenCodeMessageWithParts[],
   calls: ToolCall[],
   rawResult: CompactResult,
