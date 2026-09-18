@@ -21,33 +21,66 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
+  maxConcurrentRequests: 3,
+  requestTimeoutMs: 15_000,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
+const MIN_QUESTION_BUDGET = 50;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
+  const maxRequestTokens = Math.max(
+    1,
+    finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+  );
+  if (maxRequestTokens <= REQUEST_OVERHEAD_TOKENS) {
+    throw new Error('maxRequestTokens is too small');
+  }
+  if (
+    options.maxStateTokens !== undefined &&
+    options.maxRequestTokens !== undefined &&
+    options.maxStateTokens > options.maxRequestTokens - REQUEST_OVERHEAD_TOKENS - MIN_QUESTION_BUDGET
+  ) {
+    throw new Error('maxStateTokens must leave room for at least one Jev question batch');
+  }
+  const maxStateTokens = Math.min(
+    Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
+    Math.max(1, maxRequestTokens - REQUEST_OVERHEAD_TOKENS - 1),
+  );
+
   return {
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
-    keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
+    keepThreshold: clamp01(finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold)),
     preserveRecentMessages: Math.max(
       0,
       Math.floor(
         finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
       ),
     ),
-    maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
-      1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
-    ),
+    maxStateTokens,
+    maxRequestTokens,
     truncateHeadChars: Math.max(
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
+    ),
+    maxConcurrentRequests: Math.max(
+      1,
+      Math.floor(
+        finite(options.maxConcurrentRequests, DEFAULT_OPTIONS.maxConcurrentRequests),
+      ),
+    ),
+    requestTimeoutMs: Math.max(
+      1,
+      finite(options.requestTimeoutMs, DEFAULT_OPTIONS.requestTimeoutMs),
     ),
   };
 }
@@ -99,11 +132,16 @@ export function batchCalls(
 }
 
 export function decideCall(
-  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
+  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'> & { tool_use_id?: string },
   answer: CallAnswer,
   options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
 ): CallDecision {
-  const base = { id: call.id, tool: call.tool, ...answer };
+  const base = {
+    id: call.id,
+    tool: call.tool,
+    ...(call.tool_use_id ? { tool_use_id: call.tool_use_id } : {}),
+    ...answer,
+  };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
   if (answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
@@ -133,11 +171,13 @@ async function askBatch(
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  const removed = Math.max(0, text.length - headChars);
+  const replacement = `${head}[fast-jev-compaction truncated ${removed} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
+  if (headChars === 0) return replacement;
+  return replacement.length < text.length ? replacement : text;
 }
 
 /**
@@ -247,6 +287,71 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
   return decisions.filter((decision) => decision.reason === reason).length;
 }
 
+export function resultFromDecisions(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  decisions: readonly CallDecision[],
+  truncateHeadChars: number,
+  inherited: Pick<
+    CompactResult['stats'],
+    'stateTokens' | 'stateStage' | 'requests' | 'ms'
+  >,
+): CompactResult {
+  const charsBefore = messages.reduce(
+    (sum, message) => sum + messageChars(message),
+    0,
+  );
+  const kept = applyDecisions(
+    messages,
+    decisions,
+    calls,
+    truncateHeadChars,
+  );
+  return {
+    messages: kept,
+    decisions: [...decisions],
+    stats: {
+      messagesBefore: messages.length,
+      messagesAfter: kept.length,
+      charsBefore,
+      charsAfter: kept.reduce(
+        (sum, message) => sum + messageChars(message),
+        0,
+      ),
+      calls: calls.length,
+      kept: count(decisions, 'kept'),
+      resultsDropped: count(decisions, 'result_dropped'),
+      callsDropped: count(decisions, 'call_dropped'),
+      pinned: count(decisions, 'pinned'),
+      ...inherited,
+    },
+  };
+}
+
+/**
+ * Maps items asynchronously with bounded concurrency.
+ */
+export async function mapConcurrent<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]!);
+    }
+  }
+
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
 /**
  * Compacts a transcript by asking Jev, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
@@ -263,7 +368,6 @@ export async function compact(
   const resolved = resolveOptions(options);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -272,8 +376,10 @@ export async function compact(
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+    const answered = await mapConcurrent(
+      batches,
+      resolved.maxConcurrentRequests,
+      (batch) => askBatch(asker, state.state, batch),
     );
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
@@ -281,29 +387,16 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
-  const kept = applyDecisions(
+  return resultFromDecisions(
     messages,
-    decisions,
     calls,
-    resolved.truncateHeadChars,
-  );
-  return {
-    messages: kept,
     decisions,
-    stats: {
-      messagesBefore: messages.length,
-      messagesAfter: kept.length,
-      charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
-      calls: calls.length,
-      kept: count(decisions, 'kept'),
-      resultsDropped: count(decisions, 'result_dropped'),
-      callsDropped: count(decisions, 'call_dropped'),
-      pinned: count(decisions, 'pinned'),
+    resolved.truncateHeadChars,
+    {
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
       ms: Date.now() - started,
     },
-  };
+  );
 }

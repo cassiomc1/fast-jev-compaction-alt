@@ -57,7 +57,8 @@ export function isPinned(
 
 /**
  * Pairs every tool_use with its tool_result by `tool_use_id`. Calls without a
- * result are not candidates (there is nothing to drop yet).
+ * result are not candidates (there is nothing to drop yet). If tool_use_id is
+ * duplicated, the latest result pairs with the call.
  */
 export function collectToolCalls(
   messages: readonly Message[],
@@ -205,10 +206,24 @@ export function fitState(
   });
   const entryTokens = (entry: HistoryEntry): number => estimateTokens(JSON.stringify(entry)) + 1;
   const baseTokens = estimateTokens(JSON.stringify(stateOf([])));
+
+  let abridgedMessages = 0;
+  let collapsedMessages = 0;
+  let compactedCalls = 0;
+  let omittedMessages = 0;
+  let mergedRuns = 0;
+
   const fitted = (history: HistoryEntry[], tokens: number, stage: string): FittedState => ({
     state: stateOf(history),
     tokens,
     stage,
+    stats: {
+      abridgedMessages,
+      collapsedMessages,
+      compactedCalls,
+      omittedMessages,
+      mergedRuns,
+    },
   });
 
   let history: HistoryEntry[] = [];
@@ -250,6 +265,7 @@ export function fitState(
     if (entry.text.length <= TEXT_HEAD + TEXT_TAIL + 40) continue;
     shrink(index, (e) => {
       e.text = abridge(e.text, TEXT_HEAD, TEXT_TAIL);
+      abridgedMessages += 1;
     });
     if (fits()) return fitted(history, tokens, 'texts abridged');
   }
@@ -260,6 +276,7 @@ export function fitState(
     const original = messages[entry.i]?.text.length ?? entry.text.length;
     shrink(index, (e) => {
       e.text = `[… ${original} chars omitted …]`;
+      collapsedMessages += 1;
     });
     if (fits()) return fitted(history, tokens, 'old messages collapsed');
   }
@@ -271,6 +288,7 @@ export function fitState(
     if (pinned(entry) || !own) continue;
     shrink(index, (e) => {
       e.tool_calls = own.map(compactCall);
+      compactedCalls += own.length;
     });
     if (fits()) return fitted(history, tokens, 'old calls compacted');
   }
@@ -282,6 +300,7 @@ export function fitState(
     left.add(index);
     tokens -= perEntry[index] ?? 0;
     if (fits()) {
+      omittedMessages = left.size;
       return fitted(
         history.filter((_, i) => !left.has(i)),
         tokens,
@@ -290,10 +309,12 @@ export function fitState(
     }
   }
 
+  const unmerged = history.filter((_, i) => !left.has(i));
   history = mergeCallRuns(
-    history.filter((_, i) => !left.has(i)),
+    unmerged,
     pinned,
   );
+  mergedRuns = Math.max(0, unmerged.length - history.length);
   perEntry = history.map(entryTokens);
   tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
   if (fits()) return fitted(history, tokens, 'old calls merged');

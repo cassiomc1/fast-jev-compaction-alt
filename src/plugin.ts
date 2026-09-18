@@ -2,7 +2,7 @@ import { tool } from '@opencode-ai/plugin';
 import type { Plugin } from '@opencode-ai/plugin';
 
 import { JevClient } from './client.js';
-import { compact, decideCall, reductionRatio } from './compact.js';
+import { compact, decideCall, reductionRatio, resultFromDecisions } from './compact.js';
 import { collectToolCalls } from './state.js';
 import {
   applyDecisionsToOpenCode,
@@ -19,10 +19,11 @@ import {
   type ApplyToOpenCodeStats,
   type OpenCodeMessageWithParts,
   type OpenCodePluginOptions,
+  type ResolvedOpenCodeConfig,
 } from './opencode.js';
-import type { CallAnswer, CallDecision, CompactOptions, CompactResult } from './types.js';
+import type { CallAnswer, CallDecision, CompactOptions, CompactResult, ToolCall } from './types.js';
 
-const SERVICE = 'fast-jev-compaction';
+const SERVICE = 'fast-jev-compaction-alt';
 
 /** TypeSafe rejects the key: retrying on every request would only add latency. */
 function isAuthError(error: unknown): boolean {
@@ -59,16 +60,81 @@ function compactOptionsOf(config: {
 /**
  * Appends one stats-only JSON line (no message content) to the debug file
  * when configured. Failures are silent: diagnostics must never break a
- * session. Works on Bun and Node (`node:fs`).
+ * session. Works on Bun and Node asynchronously (`node:fs/promises`).
  */
 async function debugLine(debugFile: string | undefined, line: Record<string, unknown>): Promise<void> {
   if (!debugFile) return;
   try {
-    const { appendFileSync } = await import('node:fs');
-    appendFileSync(debugFile, `${JSON.stringify({ ts: new Date().toISOString(), ...line })}\n`);
+    const { appendFile } = await import('node:fs/promises');
+    await appendFile(debugFile, `${JSON.stringify({ ts: new Date().toISOString(), ...line })}\n`, 'utf8');
   } catch {
     // Diagnostics must never break a session.
   }
+}
+
+/**
+ * Applies host-specific policies to raw Jev compaction results:
+ * 1. Force-pins test commands that ended with an error so their output is never pruned.
+ * 2. Applies per-tool score weights (biases).
+ * 3. Recomputes final decisions, message transcripts, and stats via `resultFromDecisions`.
+ */
+export function applyHostPolicies(
+  entries: readonly OpenCodeMessageWithParts[],
+  calls: ToolCall[],
+  rawResult: CompactResult,
+  config: ResolvedOpenCodeConfig,
+): CompactResult {
+  const testErrorCallIDs = new Set<string>();
+  for (const entry of entries) {
+    for (const part of entry.parts) {
+      if (
+        isTestCommand(part) &&
+        part.state?.status === 'error' &&
+        typeof part.callID === 'string'
+      ) {
+        testErrorCallIDs.add(part.callID);
+      }
+    }
+  }
+
+  for (const call of calls) {
+    if (testErrorCallIDs.has(call.tool_use_id)) {
+      call.pinned = true;
+    }
+  }
+
+  const biasedDecisions: CallDecision[] = rawResult.decisions.map((d) => {
+    const call = calls.find((c) => c.id === d.id);
+    if (call?.pinned || d.reason === 'pinned') {
+      return decideCall(
+        call ?? { id: d.id, tool: d.tool, pinned: true, tool_use_id: d.tool_use_id },
+        d,
+        { keepThreshold: config.keepThreshold },
+      );
+    }
+    const weight = lookupToolWeight(config.toolWeights, d.tool);
+    const biasedCall = Math.min(1, Math.max(0, d.keepCall + (weight.callBias ?? 0)));
+    const biasedResult = Math.min(1, Math.max(0, d.keepResult + (weight.resultBias ?? 0)));
+    return decideCall(
+      call ?? { id: d.id, tool: d.tool, pinned: false, tool_use_id: d.tool_use_id },
+      { keepCall: biasedCall, keepResult: biasedResult },
+      { keepThreshold: config.keepThreshold },
+    );
+  });
+
+  const libMessages = openCodeToMessages(entries);
+  return resultFromDecisions(
+    libMessages,
+    calls,
+    biasedDecisions,
+    config.truncateHeadChars,
+    {
+      stateTokens: rawResult.stats.stateTokens,
+      stateStage: rawResult.stats.stateStage,
+      requests: rawResult.stats.requests,
+      ms: rawResult.stats.ms,
+    },
+  );
 }
 
 /**
@@ -81,7 +147,7 @@ async function debugLine(debugFile: string | undefined, line: Record<string, unk
  * - `experimental.session.compacting` injects the Jev keep/drop lists into the
  *   built-in compaction prompt so the summary preserves what still matters.
  *
- * Configure via plugin options (`["fast-jev-compaction", { ... }]`) or
+ * Configure via plugin options (`["fast-jev-compaction-alt", { ... }]`) or
  * `TYPESAFE_API_KEY` in the environment. All failures are logged and leave
  * the messages untouched, so the session always keeps working.
  */
@@ -110,19 +176,17 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
     partsDropped: 0,
     partsTruncated: 0,
     messagesDropped: 0,
+    charsSaved: 0,
     tokensSaved: 0,
   };
 
-  // System guidance lines from the last transform, consumed by the system
-  // prompt hook on the same request cycle.
-  let lastPruneGuidance: string[] = [];
-  // The last CompactResult, kept for the system prompt hook.
-  let lastCompactResult: CompactResult | null = null;
+  // System guidance lines keyed by session ID so concurrent sessions never leak context.
+  const guidanceBySession = new Map<string, string[]>();
 
   const statusSnapshot = (): string =>
     JSON.stringify(
       {
-        plugin: 'fast-jev-compaction',
+        plugin: 'fast-jev-compaction-alt',
         enabled: config.enabled,
         model: config.model,
         keepThreshold: config.keepThreshold,
@@ -159,14 +223,16 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
   });
 
   return {
-    'experimental.chat.messages.transform': async (_input, output) => {
-      // Reset cross-hook state for this request cycle.
-      lastPruneGuidance = [];
-      lastCompactResult = null;
+    'experimental.chat.messages.transform': async (input, output) => {
       try {
         if (!config.enabled) return;
         const messages = output.messages as unknown as OpenCodeMessageWithParts[];
         if (!Array.isArray(messages) || messages.length === 0) return;
+        const sessionKey =
+          (input as { sessionID?: string })?.sessionID ??
+          ((messages[0]?.info as unknown as Record<string, unknown>)?.sessionID as string | undefined) ??
+          '__default__';
+
         if (!config.apiKey) {
           await log({
             body: {
@@ -190,6 +256,9 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           return;
         }
 
+        const libMessages = openCodeToMessages(messages);
+        const calls = collectToolCalls(libMessages, config.preserveRecentMessages);
+
         // --- Test failure pinning ---
         // Find callIDs of test commands that ended with an error: these must
         // never be pruned because the agent needs the exact failure output.
@@ -206,10 +275,6 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           }
         }
 
-        const libMessages = openCodeToMessages(messages);
-        const calls = collectToolCalls(libMessages, config.preserveRecentMessages);
-
-        // Force-pin test-error calls so they are never candidates.
         for (const call of calls) {
           if (testErrorCallIDs.has(call.tool_use_id)) {
             call.pinned = true;
@@ -233,25 +298,8 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           model: config.model,
           baseUrl: config.baseUrl,
         });
-        const result = await compact(libMessages, asker, compactOptionsOf(config));
-
-        // --- Tool weight bias ---
-        // Adjust Jev scores per-tool before the threshold comparison, then
-        // re-decide. This keeps the library's `compact()` unmodified while
-        // giving heavier tools (shells, edits) a better chance of staying.
-        const biasedDecisions: typeof result.decisions = result.decisions.map((d) => {
-          if (d.reason === 'pinned') return d;
-          const weight = lookupToolWeight(config.toolWeights, d.tool);
-          const biasedCall = Math.min(1, d.keepCall + (weight.callBias ?? 0));
-          const biasedResult = Math.min(1, d.keepResult + (weight.resultBias ?? 0));
-          const call = calls.find((c) => c.id === d.id);
-          return decideCall(
-            call ?? { id: d.id, tool: d.tool, pinned: false },
-            { keepCall: biasedCall, keepResult: biasedResult },
-            { keepThreshold: config.keepThreshold },
-          );
-        });
-        const biasedResult: CompactResult = { ...result, decisions: biasedDecisions };
+        const rawResult = await compact(libMessages, asker, compactOptionsOf(config));
+        const biasedResult = applyHostPolicies(messages, calls, rawResult, config);
 
         if (reductionRatio(biasedResult) < config.minReductionRatio) {
           await log({
@@ -298,14 +346,18 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
         (output.messages as unknown[]).splice(0, messages.length, ...(next as unknown[]));
 
         // Update cumulative stats.
+        const saved = biasedResult.stats.charsBefore - biasedResult.stats.charsAfter;
         cumulativeStats.partsDropped += stats.partsDropped;
         cumulativeStats.partsTruncated += stats.partsTruncated;
         cumulativeStats.messagesDropped += stats.messagesDropped;
-        cumulativeStats.tokensSaved += biasedResult.stats.charsBefore - biasedResult.stats.charsAfter;
+        cumulativeStats.charsSaved += saved;
+        cumulativeStats.tokensSaved += saved;
 
         // Store for the system prompt hook.
-        lastPruneGuidance = pruningSystemGuidance(biasedResult, stats);
-        lastCompactResult = biasedResult;
+        guidanceBySession.set(
+          sessionKey,
+          pruningSystemGuidance(biasedResult, stats, config.truncateHeadChars),
+        );
 
         await note({
           hook: 'transform',
@@ -347,13 +399,17 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
       }
     },
 
-    'experimental.chat.system.transform': async (_input, output) => {
+    'experimental.chat.system.transform': async (input, output) => {
       // Inject guidance when the transform hook pruned something on this
       // request cycle, so the assistant knows which tools were compacted.
-      if (lastPruneGuidance.length > 0) {
-        for (const line of lastPruneGuidance) {
+      const sessionKey =
+        (input as { sessionID?: string })?.sessionID ?? '__default__';
+      const guidance = guidanceBySession.get(sessionKey);
+      if (guidance && guidance.length > 0) {
+        for (const line of guidance) {
           output.system.push(line);
         }
+        guidanceBySession.delete(sessionKey);
       }
     },
 
@@ -384,6 +440,26 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
         if (!Array.isArray(entries) || entries.length === 0) return;
         const libMessages = openCodeToMessages(entries);
         const calls = collectToolCalls(libMessages, config.preserveRecentMessages);
+
+        // Pre-pin test-error calls so candidates check is accurate
+        const testErrorCallIDs = new Set<string>();
+        for (const entry of entries) {
+          for (const part of entry.parts) {
+            if (
+              isTestCommand(part) &&
+              part.state?.status === 'error' &&
+              typeof part.callID === 'string'
+            ) {
+              testErrorCallIDs.add(part.callID);
+            }
+          }
+        }
+        for (const call of calls) {
+          if (testErrorCallIDs.has(call.tool_use_id)) {
+            call.pinned = true;
+          }
+        }
+
         if (calls.filter((call) => !call.pinned).length === 0) {
           output.context.push(COMPACTION_VERBATIM_GUIDANCE);
           return;
@@ -393,22 +469,23 @@ export const FastJevCompactionPlugin: Plugin = async ({ client }, options) => {
           model: config.model,
           baseUrl: config.baseUrl,
         });
-        const result = await compact(libMessages, asker, compactOptionsOf(config));
-        for (const line of compactionContext(result)) output.context.push(line);
+        const rawResult = await compact(libMessages, asker, compactOptionsOf(config));
+        const biasedResult = applyHostPolicies(entries, calls, rawResult, config);
+        for (const line of compactionContext(biasedResult)) output.context.push(line);
         await note({
           hook: 'compacting',
           outcome: 'guidance',
           sessionID: input.sessionID,
           contextLines: output.context.length,
-          summary: decisionSummary(result),
-          decisions: decisionLog(result),
+          summary: decisionSummary(biasedResult),
+          decisions: decisionLog(biasedResult),
         });
         await log({
           body: {
             service: SERVICE,
             level: 'info',
-            message: `compacting guidance injected (${decisionSummary(result)})`,
-            extra: { decisions: decisionLog(result) },
+            message: `compacting guidance injected (${decisionSummary(biasedResult)})`,
+            extra: { decisions: decisionLog(biasedResult) },
           },
         });
       } catch (error) {

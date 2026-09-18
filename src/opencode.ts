@@ -1,4 +1,4 @@
-import { reductionRatio } from './compact.js';
+import { DEFAULT_OPTIONS, reductionRatio } from './compact.js';
 import type {
   CallDecision,
   CompactOptions,
@@ -119,18 +119,18 @@ export interface ResolvedOpenCodeConfig {
 }
 
 export const OPENCODE_DEFAULTS = {
+  ...DEFAULT_OPTIONS,
   model: 'jev-latest',
-  keepThreshold: 0.5,
-  preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
-  truncateHeadChars: 300,
   minReductionRatio: 0,
   enabled: true,
 } as const;
 
 function finite(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
 }
 
 /** Merges default tool weights with user overrides; all keys are lower-cased. */
@@ -185,7 +185,7 @@ export function resolveOpenCodeConfig(
     model,
     baseUrl: options.baseUrl,
     goal: options.goal,
-    keepThreshold: finite(options.keepThreshold, OPENCODE_DEFAULTS.keepThreshold),
+    keepThreshold: clamp01(finite(options.keepThreshold, OPENCODE_DEFAULTS.keepThreshold)),
     preserveRecentMessages: Math.max(
       0,
       Math.floor(finite(options.preserveRecentMessages, OPENCODE_DEFAULTS.preserveRecentMessages)),
@@ -202,7 +202,7 @@ export function resolveOpenCodeConfig(
       0,
       Math.floor(finite(options.truncateHeadChars, OPENCODE_DEFAULTS.truncateHeadChars)),
     ),
-    minReductionRatio: finite(options.minReductionRatio, OPENCODE_DEFAULTS.minReductionRatio),
+    minReductionRatio: clamp01(finite(options.minReductionRatio, OPENCODE_DEFAULTS.minReductionRatio)),
     enabled: options.enabled ?? OPENCODE_DEFAULTS.enabled,
     debugFile,
     toolWeights: mergeToolWeights(DEFAULT_TOOL_WEIGHTS, options.toolWeights),
@@ -261,11 +261,13 @@ export function openCodeToMessages(entries: readonly OpenCodeMessageWithParts[])
 }
 
 function truncatedToolText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  const removed = Math.max(0, text.length - headChars);
+  const replacement = `${head}[fast-jev-compaction truncated ${removed} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
+  if (headChars === 0) return replacement;
+  return replacement.length < text.length ? replacement : text;
 }
 
 /** Part types that carry conversation content into the model. */
@@ -438,10 +440,17 @@ export function isTestCommand(part: OpenCodePart): boolean {
  * Jev judged still needed and may drop what Jev let go.
  */
 export function compactionContext(result: CompactResult): string[] {
-  const kept = result.decisions.filter((d) => d.action === 'keep').map((d) => `${d.id} ${d.tool}`);
+  const kept = result.decisions
+    .filter((d) => d.action === 'keep')
+    .map((d) => `${d.id} ${d.tool}${d.tool_use_id ? ` [callID: ${d.tool_use_id}]` : ''}`);
   const dropped = result.decisions
     .filter((d) => d.action !== 'keep')
-    .map((d) => `${d.id} ${d.tool} (${d.action === 'drop_result' ? 'output stale' : 'call stale'})`);
+    .map(
+      (d) =>
+        `${d.id} ${d.tool} (${d.action === 'drop_result' ? 'output stale' : 'call stale'})${
+          d.tool_use_id ? ` [callID: ${d.tool_use_id}]` : ''
+        }`,
+    );
   const context = [
     `fast-jev-compaction scored every tool call for whether it is still needed (${decisionSummary(result)}).`,
   ];
@@ -470,6 +479,7 @@ export function compactionContext(result: CompactResult): string[] {
 export function pruningSystemGuidance(
   result: CompactResult,
   stats: ApplyToOpenCodeStats,
+  truncateHeadChars: number = 300,
 ): string[] {
   if (stats.partsDropped === 0 && stats.partsTruncated === 0 && stats.messagesDropped === 0) {
     return [];
@@ -480,8 +490,12 @@ export function pruningSystemGuidance(
   const truncated = result.decisions.filter((d) => d.action === 'drop_result');
   const dropped = result.decisions.filter((d) => d.action === 'drop_call');
   if (truncated.length > 0) {
+    const preserved =
+      truncateHeadChars === 0
+        ? 'result body removed; only a truncation note remains'
+        : `only first ~${truncateHeadChars} chars kept`;
     lines.push(
-      `- ${truncated.length} tool result(s) truncated (only first ~300 chars kept): ${truncated.map((d) => `${d.tool}[${d.id}]`).join(', ')}`,
+      `- ${truncated.length} tool result(s) truncated (${preserved}): ${truncated.map((d) => `${d.tool}[${d.id}]`).join(', ')}`,
     );
   }
   if (dropped.length > 0) {

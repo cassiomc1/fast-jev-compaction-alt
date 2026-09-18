@@ -8,7 +8,7 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, DEFAULT_OPTIONS, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
   CompactOptions,
@@ -19,7 +19,8 @@ import type {
   ToolUse,
 } from '../src/types.js';
 
-const HOOK_DEFAULTS = {
+export const HOOK_DEFAULTS = {
+  ...DEFAULT_OPTIONS,
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
@@ -57,6 +58,14 @@ function optionString(options: PluginOptions, key: string): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value));
+}
+
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
 export function resolveHookConfig(options: PluginOptions): HookConfig {
   const numbers: Partial<Omit<CompactOptions, 'goal'>> = {};
@@ -70,13 +79,18 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
   }
+  if (typeof numbers.keepThreshold === 'number') {
+    numbers.keepThreshold = clamp01(numbers.keepThreshold);
+  }
   const config: HookConfig = {
     ...numbers,
-    compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
-    minReductionRatio: optionNumber(
-      options,
-      'minReductionRatio',
-      HOOK_DEFAULTS.minReductionRatio,
+    compactAtPercent: clampPercent(optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent)),
+    minReductionRatio: clamp01(
+      optionNumber(
+        options,
+        'minReductionRatio',
+        HOOK_DEFAULTS.minReductionRatio,
+      ),
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
   };

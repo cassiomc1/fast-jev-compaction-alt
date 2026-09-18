@@ -550,7 +550,7 @@ describe('jev_compaction_status tool', () => {
     const statusTool = hooks.tool?.jev_compaction_status;
     expect(statusTool?.description).toContain('fast-jev-compaction');
     const before = JSON.parse(await statusTool!.execute({}, {} as never)) as Record<string, unknown>;
-    expect(before).toMatchObject({ plugin: 'fast-jev-compaction', enabled: true, model: 'jev-latest', key: 'configured', lastRun: null });
+    expect(before).toMatchObject({ plugin: 'fast-jev-compaction-alt', enabled: true, model: 'jev-latest', key: 'configured', lastRun: null });
     expect(JSON.stringify(before)).not.toContain('216194089');
     const entries = transcript();
     await hooks['experimental.chat.messages.transform']!(
@@ -824,5 +824,183 @@ describe('tool weight bias in plugin', () => {
     expect(c2).toBeDefined();
     // The result should NOT be truncated (it was "kept" not "drop_result").
     expect(c2?.state?.output).not.toContain('fast-jev-compaction truncated');
+  });
+
+  it('skips compaction when biased decisions drop reduction ratio below minReductionRatio', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch(() => 0.1),
+    );
+    const logged: unknown[] = [];
+    const entries = transcript();
+    const originalText = JSON.stringify(entries);
+
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      {
+        apiKey: 'k',
+        preserveRecentMessages: 1,
+        minReductionRatio: 0.2,
+        toolWeights: {
+          Read: { callBias: 0.9, resultBias: 0.9 },
+          Bash: { callBias: 0.9, resultBias: 0.9 },
+        },
+      } as never,
+    );
+    const output = { messages: entries as unknown[] };
+    await hooks['experimental.chat.messages.transform']!({} as never, output as never);
+
+    expect(JSON.stringify(output.messages)).toBe(originalText);
+    const belowRatioLog = logged.find((entry) =>
+      JSON.stringify(entry).includes('below minReductionRatio'),
+    );
+    expect(belowRatioLog).toBeDefined();
+  });
+});
+
+describe('pruningSystemGuidance', () => {
+  it('reflects custom truncateHeadChars in output messages', () => {
+    const mockResult: CompactResult = {
+      messages: [],
+      decisions: [
+        { id: 't1', tool: 'Read', action: 'drop_result', reason: 'result_dropped', keepCall: 0.9, keepResult: 0.1 },
+      ],
+      stats: {
+        messagesBefore: 3,
+        messagesAfter: 3,
+        charsBefore: 1000,
+        charsAfter: 200,
+        calls: 1,
+        kept: 0,
+        resultsDropped: 1,
+        callsDropped: 0,
+        pinned: 0,
+        stateTokens: 100,
+        stateStage: 'full',
+        requests: 1,
+        ms: 10,
+      },
+    };
+    const stats = { partsDropped: 0, partsTruncated: 1, messagesDropped: 0, charsSaved: 800 };
+
+    const zeroHead = pruningSystemGuidance(mockResult, stats, 0);
+    expect(zeroHead.join('\n')).toContain('result body removed; only a truncation note remains');
+
+    const customHead = pruningSystemGuidance(mockResult, stats, 500);
+    expect(customHead.join('\n')).toContain('only first ~500 chars kept');
+  });
+});
+
+describe('compactionContext', () => {
+  it('includes real OpenCode callID values in guidance context', () => {
+    const mockResult: CompactResult = {
+      messages: [],
+      decisions: [
+        { id: 't1', tool: 'Read', action: 'keep', reason: 'kept', keepCall: 0.9, keepResult: 0.8, tool_use_id: 'call-real-123' },
+        { id: 't2', tool: 'Bash', action: 'drop_result', reason: 'result_dropped', keepCall: 0.9, keepResult: 0.1, tool_use_id: 'call-real-456' },
+      ],
+      stats: {
+        messagesBefore: 3,
+        messagesAfter: 3,
+        charsBefore: 1000,
+        charsAfter: 500,
+        calls: 2,
+        kept: 1,
+        resultsDropped: 1,
+        callsDropped: 0,
+        pinned: 0,
+        stateTokens: 100,
+        stateStage: 'full',
+        requests: 1,
+        ms: 10,
+      },
+    };
+    const ctx = compactionContext(mockResult);
+    expect(ctx.some((line) => line.includes('[callID: call-real-123]'))).toBe(true);
+    expect(ctx.some((line) => line.includes('[callID: call-real-456]'))).toBe(true);
+  });
+});
+
+describe('plugin session handling and isolation', () => {
+  it('applies test-error pinning and tool weights in experimental.session.compacting', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch(() => 0.1),
+    );
+    const logged: unknown[] = [];
+    const sessionEntries: OpenCodeMessageWithParts[] = [
+      textEntry('user', 'Fix the test failure'),
+      toolEntry('test-call-1', 'Bash', { command: 'npm test' }, 'FAIL: test failed', 'error'),
+      toolEntry('read-call-2', 'Read', { file_path: 'foo.ts' }, 'code content'),
+      textEntry('user', 'continue'),
+    ];
+
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged, sessionEntries) } as never,
+      {
+        apiKey: 'k',
+        preserveRecentMessages: 0,
+        toolWeights: {
+          Read: { callBias: 0.9, resultBias: 0.9 },
+        },
+      } as never,
+    );
+
+    const output = { context: [] as string[] };
+    await hooks['experimental.session.compacting']!(
+      { sessionID: 'sess-1' } as never,
+      output as never,
+    );
+
+    expect(output.context.length).toBeGreaterThan(0);
+    const keptLine = output.context.find((line) => line.includes('Treat these tool calls'));
+    expect(keptLine).toBeDefined();
+    expect(keptLine).toContain('Bash');
+    expect(keptLine).toContain('callID: test-call-1');
+    expect(keptLine).toContain('Read');
+    expect(keptLine).toContain('callID: read-call-2');
+  });
+
+  it('isolates system guidance between sessions by sessionID', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch((name) => {
+        if (name === 'call_t2') return 0.9;
+        return 0.1;
+      }),
+    );
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1 } as never,
+    );
+
+    const entriesA = transcript();
+    await hooks['experimental.chat.messages.transform']!(
+      { sessionID: 'session-A' } as never,
+      { messages: entriesA as unknown[] } as never,
+    );
+
+    const outputB = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'session-B' } as never,
+      outputB as never,
+    );
+    expect(outputB.system).toEqual([]);
+
+    const outputA = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'session-A' } as never,
+      outputA as never,
+    );
+    expect(outputA.system.length).toBeGreaterThan(0);
+    expect(outputA.system.join('\n')).toContain('[fast-jev-compaction]');
+
+    const outputASecond = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'session-A' } as never,
+      outputASecond as never,
+    );
+    expect(outputASecond.system).toEqual([]);
   });
 });
