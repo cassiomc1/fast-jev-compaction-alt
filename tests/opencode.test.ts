@@ -89,11 +89,28 @@ describe('resolveOpenCodeConfig', () => {
       minReductionRatio: 0,
       enabled: true,
       apiKey: undefined,
+      maxConcurrentRequests: 3,
+      requestTimeoutMs: 15_000,
     });
     expect(
-      resolveOpenCodeConfig({ apiKey: 'k', model: 'jev-x', enabled: false }, { TYPESAFE_API_KEY: 'env' }),
-    ).toMatchObject({ apiKey: 'k', model: 'jev-x', enabled: false });
+      resolveOpenCodeConfig(
+        { apiKey: 'k', model: 'jev-x', enabled: false, maxConcurrentRequests: 2, requestTimeoutMs: 5000 },
+        { TYPESAFE_API_KEY: 'env' },
+      ),
+    ).toMatchObject({ apiKey: 'k', model: 'jev-x', enabled: false, maxConcurrentRequests: 2, requestTimeoutMs: 5000 });
     expect(resolveOpenCodeConfig({}, { TYPESAFE_API_KEY: 'env' }).apiKey).toBe('env');
+  });
+
+  it('parses FAST_JEV_MAX_CONCURRENT_REQUESTS and FAST_JEV_REQUEST_TIMEOUT_MS from env (Finding 3)', () => {
+    const config = resolveOpenCodeConfig(
+      {},
+      {
+        FAST_JEV_MAX_CONCURRENT_REQUESTS: '5',
+        FAST_JEV_REQUEST_TIMEOUT_MS: '8000',
+      },
+    );
+    expect(config.maxConcurrentRequests).toBe(5);
+    expect(config.requestTimeoutMs).toBe(8000);
   });
 });
 
@@ -550,7 +567,7 @@ describe('jev_compaction_status tool', () => {
     const statusTool = hooks.tool?.jev_compaction_status;
     expect(statusTool?.description).toContain('fast-jev-compaction');
     const before = JSON.parse(await statusTool!.execute({}, {} as never)) as Record<string, unknown>;
-    expect(before).toMatchObject({ plugin: 'fast-jev-compaction', enabled: true, model: 'jev-latest', key: 'configured', lastRun: null });
+    expect(before).toMatchObject({ plugin: 'fast-jev-compaction-alt', enabled: true, model: 'jev-latest', key: 'configured', lastRun: null });
     expect(JSON.stringify(before)).not.toContain('216194089');
     const entries = transcript();
     await hooks['experimental.chat.messages.transform']!(
@@ -590,6 +607,11 @@ describe('jev_compaction_status tool', () => {
     const cum = status.cumulativeStats as Record<string, number>;
     expect(cum.runs).toBe(2);
     expect(cum.partsDropped).toBeGreaterThan(0);
+    expect(cum.charsSaved).toBeGreaterThan(0);
+    expect('tokensSaved' in cum).toBe(false);
+    expect(JSON.stringify(status)).not.toContain('tokensSaved');
+    expect(statusTool?.description).toContain('characters saved');
+    expect(statusTool?.description).not.toContain('tokens saved');
   });
 });
 
@@ -773,6 +795,35 @@ describe('system prompt hook', () => {
     expect(systemOutput.system.join('\n')).toContain('pruned');
   });
 
+  it('appends guidance to existing system prompt preserving single block (Finding 2)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch((name) => {
+        if (name === 'call_t1' || name === 'result_t1') return 0.9;
+        if (name === 'call_t2') return 0.9;
+        return 0.1;
+      }),
+    );
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1 } as never,
+    );
+    const entries = transcript();
+    await hooks['experimental.chat.messages.transform']!(
+      {} as never,
+      { messages: entries as unknown[] } as never,
+    );
+    const systemOutput = { system: ['You are a helpful assistant.'] };
+    await hooks['experimental.chat.system.transform']!(
+      {} as never,
+      systemOutput as never,
+    );
+    expect(systemOutput.system).toHaveLength(1);
+    expect(systemOutput.system[0]).toContain('You are a helpful assistant.');
+    expect(systemOutput.system[0]).toContain('[fast-jev-compaction]');
+  });
+
   it('injects nothing when there was no pruning', async () => {
     const logged: unknown[] = [];
     const hooks = await FastJevCompactionPlugin(
@@ -824,5 +875,324 @@ describe('tool weight bias in plugin', () => {
     expect(c2).toBeDefined();
     // The result should NOT be truncated (it was "kept" not "drop_result").
     expect(c2?.state?.output).not.toContain('fast-jev-compaction truncated');
+  });
+
+  it('skips compaction when biased decisions drop reduction ratio below minReductionRatio', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch(() => 0.1),
+    );
+    const logged: unknown[] = [];
+    const entries = transcript();
+    const originalText = JSON.stringify(entries);
+
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      {
+        apiKey: 'k',
+        preserveRecentMessages: 1,
+        minReductionRatio: 0.2,
+        toolWeights: {
+          Read: { callBias: 0.9, resultBias: 0.9 },
+          Bash: { callBias: 0.9, resultBias: 0.9 },
+        },
+      } as never,
+    );
+    const output = { messages: entries as unknown[] };
+    await hooks['experimental.chat.messages.transform']!({} as never, output as never);
+
+    expect(JSON.stringify(output.messages)).toBe(originalText);
+    const belowRatioLog = logged.find((entry) =>
+      JSON.stringify(entry).includes('below minReductionRatio'),
+    );
+    expect(belowRatioLog).toBeDefined();
+  });
+});
+
+describe('pruningSystemGuidance', () => {
+  it('reflects custom truncateHeadChars in output messages', () => {
+    const mockResult: CompactResult = {
+      messages: [],
+      decisions: [
+        { id: 't1', tool: 'Read', action: 'drop_result', reason: 'result_dropped', keepCall: 0.9, keepResult: 0.1 },
+      ],
+      stats: {
+        messagesBefore: 3,
+        messagesAfter: 3,
+        charsBefore: 1000,
+        charsAfter: 200,
+        calls: 1,
+        kept: 0,
+        resultsDropped: 1,
+        callsDropped: 0,
+        pinned: 0,
+        stateTokens: 100,
+        stateStage: 'full',
+        requests: 1,
+        ms: 10,
+      },
+    };
+    const stats = { partsDropped: 0, partsTruncated: 1, messagesDropped: 0, charsSaved: 800 };
+
+    const zeroHead = pruningSystemGuidance(mockResult, stats, 0);
+    expect(zeroHead.join('\n')).toContain('result body removed; only a truncation note remains');
+
+    const customHead = pruningSystemGuidance(mockResult, stats, 500);
+    expect(customHead.join('\n')).toContain('only first ~500 chars kept');
+  });
+});
+
+describe('compactionContext', () => {
+  it('includes real OpenCode callID values in guidance context', () => {
+    const mockResult: CompactResult = {
+      messages: [],
+      decisions: [
+        { id: 't1', tool: 'Read', action: 'keep', reason: 'kept', keepCall: 0.9, keepResult: 0.8, tool_use_id: 'call-real-123' },
+        { id: 't2', tool: 'Bash', action: 'drop_result', reason: 'result_dropped', keepCall: 0.9, keepResult: 0.1, tool_use_id: 'call-real-456' },
+      ],
+      stats: {
+        messagesBefore: 3,
+        messagesAfter: 3,
+        charsBefore: 1000,
+        charsAfter: 500,
+        calls: 2,
+        kept: 1,
+        resultsDropped: 1,
+        callsDropped: 0,
+        pinned: 0,
+        stateTokens: 100,
+        stateStage: 'full',
+        requests: 1,
+        ms: 10,
+      },
+    };
+    const ctx = compactionContext(mockResult);
+    expect(ctx.some((line) => line.includes('[callID: call-real-123]'))).toBe(true);
+    expect(ctx.some((line) => line.includes('[callID: call-real-456]'))).toBe(true);
+  });
+});
+
+describe('plugin session handling and isolation', () => {
+  it('applies test-error pinning and tool weights in experimental.session.compacting', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch(() => 0.1),
+    );
+    const logged: unknown[] = [];
+    const sessionEntries: OpenCodeMessageWithParts[] = [
+      textEntry('user', 'Fix the test failure'),
+      toolEntry('test-call-1', 'Bash', { command: 'npm test' }, 'FAIL: test failed', 'error'),
+      toolEntry('read-call-2', 'Read', { file_path: 'foo.ts' }, 'code content'),
+      textEntry('user', 'continue'),
+    ];
+
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged, sessionEntries) } as never,
+      {
+        apiKey: 'k',
+        preserveRecentMessages: 0,
+        toolWeights: {
+          Read: { callBias: 0.9, resultBias: 0.9 },
+        },
+      } as never,
+    );
+
+    const output = { context: [] as string[] };
+    await hooks['experimental.session.compacting']!(
+      { sessionID: 'sess-1' } as never,
+      output as never,
+    );
+
+    expect(output.context.length).toBeGreaterThan(0);
+    const keptLine = output.context.find((line) => line.includes('Treat these tool calls'));
+    expect(keptLine).toBeDefined();
+    expect(keptLine).toContain('Bash');
+    expect(keptLine).toContain('callID: test-call-1');
+    expect(keptLine).toContain('Read');
+    expect(keptLine).toContain('callID: read-call-2');
+  });
+
+  it('isolates system guidance between sessions by sessionID', async () => {
+    vi.stubGlobal(
+      'fetch',
+      fakeFetch((name) => {
+        if (name === 'call_t2') return 0.9;
+        return 0.1;
+      }),
+    );
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1 } as never,
+    );
+
+    const entriesA = transcript();
+    await hooks['experimental.chat.messages.transform']!(
+      { sessionID: 'session-A' } as never,
+      { messages: entriesA as unknown[] } as never,
+    );
+
+    const outputB = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'session-B' } as never,
+      outputB as never,
+    );
+    expect(outputB.system).toEqual([]);
+
+    const outputA = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'session-A' } as never,
+      outputA as never,
+    );
+    expect(outputA.system.length).toBeGreaterThan(0);
+    expect(outputA.system.join('\n')).toContain('[fast-jev-compaction]');
+
+    const outputASecond = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']!(
+      { sessionID: 'session-A' } as never,
+      outputASecond as never,
+    );
+    expect(outputASecond.system).toEqual([]);
+  });
+});
+
+describe('plugin timeout enforcement and error pinning (Findings 3, 4, 5)', () => {
+  it('enforces requestTimeoutMs and aborts cleanly in messages.transform (Finding 4)', async () => {
+    vi.stubGlobal('fetch', async (_url: string, init?: { signal?: AbortSignal }) => {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          resolve({
+            status: 200,
+            ok: true,
+            text: async () => JSON.stringify({ answers: {} }),
+          } as unknown as Response);
+        }, 150);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    });
+
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1, requestTimeoutMs: 25 } as never,
+    );
+    const entries = transcript();
+    const originalJson = JSON.stringify(entries);
+    const output = { messages: entries as unknown[] };
+
+    await hooks['experimental.chat.messages.transform']!(
+      {} as never,
+      output as never,
+    );
+
+    // Messages must remain completely intact (graceful fallback)
+    expect(JSON.stringify(output.messages)).toBe(originalJson);
+    const timeoutLog = logged.find((entry) =>
+      JSON.stringify(entry).includes('pruning skipped') &&
+      (JSON.stringify(entry).includes('aborted') || JSON.stringify(entry).includes('timeout')),
+    );
+    expect(timeoutLog).toBeDefined();
+  });
+
+  it('enforces requestTimeoutMs and adds fallback guidance in session.compacting (Finding 4)', async () => {
+    vi.stubGlobal('fetch', async (_url: string, init?: { signal?: AbortSignal }) => {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          resolve({
+            status: 200,
+            ok: true,
+            text: async () => JSON.stringify({ answers: {} }),
+          } as unknown as Response);
+        }, 150);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      });
+    });
+
+    const logged: unknown[] = [];
+    const sessionEntries = transcript();
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged, sessionEntries) } as never,
+      { apiKey: 'k', preserveRecentMessages: 1, requestTimeoutMs: 25 } as never,
+    );
+    const output = { context: [] as string[] };
+
+    await hooks['experimental.session.compacting']!(
+      { sessionID: 'sess-timeout' } as never,
+      output as never,
+    );
+
+    expect(output.context.length).toBeGreaterThan(0);
+    expect(output.context[0]).toContain(COMPACTION_FALLBACK_GUIDANCE);
+    const timeoutLog = logged.find((entry) =>
+      JSON.stringify(entry).includes('compacting guidance fell back') &&
+      (JSON.stringify(entry).includes('aborted') || JSON.stringify(entry).includes('timeout')),
+    );
+    expect(timeoutLog).toBeDefined();
+  });
+
+  it('pins failing test commands so they are never sent to Jev as candidate questions (Finding 5)', async () => {
+    const askedQuestions: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      async (_url: string, init?: { body?: string }) => {
+        const parsed = JSON.parse(init?.body ?? '{}') as { questions?: Record<string, unknown> };
+        const questions = parsed.questions ?? {};
+        askedQuestions.push(...Object.keys(questions));
+        const answers = Object.fromEntries(
+          Object.keys(questions).map((k) => [
+            k,
+            { type: 'noul', noul: k.startsWith('call_') ? 0.9 : 0.01 },
+          ]),
+        );
+        return {
+          status: 200,
+          ok: true,
+          text: async () => JSON.stringify({ answers }),
+        } as unknown as Response;
+      },
+    );
+
+    const logged: unknown[] = [];
+    const hooks = await FastJevCompactionPlugin(
+      { client: fakeClient(logged) } as never,
+      { apiKey: 'k', preserveRecentMessages: 0, keepThreshold: 0.5 } as never,
+    );
+
+    const failingTestOutput = 'FAIL src/math.test.ts\nExpected 4, received 5\nexit code 1';
+    const entries: OpenCodeMessageWithParts[] = [
+      textEntry('user', 'Fix the test failure'),
+      toolEntry('call-fail-test', 'Bash', { command: 'npm test' }, failingTestOutput, 'error'),
+      toolEntry('call-read-code', 'Read', { file_path: 'src/math.ts' }, fileA, 'completed'),
+      textEntry('user', 'continue'),
+    ];
+
+    const output = { messages: entries as unknown[] };
+    await hooks['experimental.chat.messages.transform']!(
+      {} as never,
+      output as never,
+    );
+
+    // 1. Failing test call/result must NEVER be sent as a question to Jev
+    expect(askedQuestions).not.toContain('call_t1');
+    expect(askedQuestions).not.toContain('result_t1');
+    expect(askedQuestions).toContain('call_t2');
+    expect(askedQuestions).toContain('result_t2');
+
+    // 2. The failing test output remains completely intact and verbatim in messages
+    const transformed = output.messages as OpenCodeMessageWithParts[];
+    const testToolPart = transformed[1]?.parts[0] as OpenCodePart;
+    expect(testToolPart.state?.status).toBe('error');
+    expect((testToolPart.state as { error?: string })?.error).toBe(failingTestOutput);
+
+    // 3. Read call was unpinned and dropped/truncated because keepThreshold=0.99 > 0.01
+    const readToolPart = transformed[2]?.parts[0] as OpenCodePart;
+    expect(readToolPart.state?.status).toBe('completed');
+    expect((readToolPart.state as { output?: string })?.output).toContain('[fast-jev-compaction truncated');
   });
 });

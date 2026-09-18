@@ -59,6 +59,8 @@ export type CallAction = 'keep' | 'drop_result' | 'drop_call';
 export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
+  /** Host call ID (e.g. OpenCode callID, Claude tool_use_id). */
+  tool_use_id?: string;
   action: CallAction;
   reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
 }
@@ -85,11 +87,21 @@ export interface CompactionState {
   history: HistoryEntry[];
 }
 
+export interface FittedStateStats {
+  abridgedMessages: number;
+  collapsedMessages: number;
+  compactedCalls: number;
+  omittedMessages: number;
+  mergedRuns: number;
+}
+
 export interface FittedState {
   state: CompactionState;
   tokens: number;
   /** Which fitting stage produced the state, for diagnostics. */
   stage: string;
+  /** Detailed observability counts for state fitting stages. */
+  stats?: FittedStateStats;
 }
 
 export interface CompactOptions {
@@ -105,6 +117,12 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /** Maximum number of concurrent Jev requests. Default 3. */
+  maxConcurrentRequests?: number;
+  /** Timeout in milliseconds for Jev network requests. Default 15000. */
+  requestTimeoutMs?: number;
+  /** Specific tool use IDs to pin unconditionally so they are never sent to Jev as candidates. */
+  pinnedToolUseIds?: ReadonlySet<string> | readonly string[];
 }
 
 export interface ResolvedCompactOptions {
@@ -114,6 +132,9 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  maxConcurrentRequests: number;
+  requestTimeoutMs: number;
+  pinnedToolUseIds?: ReadonlySet<string>;
 }
 
 export interface CompactResult {
@@ -127,7 +148,12 @@ export interface CompactResult {
     charsAfter: number;
     calls: number;
     kept: number;
+    /** Number of tool results marked stale by Jev decisions (for backward compatibility). */
     resultsDropped: number;
+    /** Number of tool results whose text was actually truncated in the messages. */
+    resultsTruncated: number;
+    /** Number of tool results marked stale by Jev decisions. */
+    resultsMarkedStale?: number;
     callsDropped: number;
     pinned: number;
     stateTokens: number;

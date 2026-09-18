@@ -1,17 +1,19 @@
 {
   "$schema": "https://opencode.ai/config.json",
   // Install the plugin from npm (OpenCode resolves the package's "./server" entrypoint).
-  "plugin": ["fast-jev-compaction"],
+  "plugin": ["fast-jev-compaction-alt"],
   // With options:
   // "plugin": [
   //   [
-  //     "fast-jev-compaction",
+  //     "fast-jev-compaction-alt",
   //     {
   //       "keepThreshold": 0.5,
   //       "preserveRecentMessages": 6,
   //       "maxStateTokens": 25000,
   //       "maxRequestTokens": 30000,
   //       "truncateHeadChars": 300,
+  //       "maxConcurrentRequests": 3,
+  //       "requestTimeoutMs": 15000,
   //       "minReductionRatio": 0,
   //       "model": "jev-latest",
   //       "enabled": true

@@ -21,34 +21,73 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
+  maxConcurrentRequests: 3,
+  requestTimeoutMs: 15_000,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
+const MIN_QUESTION_BUDGET = 150;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
+  const maxRequestTokens = Math.max(
+    1,
+    Math.floor(finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens)),
+  );
+  const minRequiredRequest = REQUEST_OVERHEAD_TOKENS + MIN_QUESTION_BUDGET + 1;
+  if (maxRequestTokens < minRequiredRequest) {
+    throw new Error(
+      `maxRequestTokens must be at least ${minRequiredRequest} to leave room for overhead and question budget`,
+    );
+  }
+
+  const safeMaxStateTokens = maxRequestTokens - REQUEST_OVERHEAD_TOKENS - MIN_QUESTION_BUDGET;
+  const requestedStateTokens = Math.max(
+    1,
+    Math.floor(finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
+  );
+  const maxStateTokens = Math.min(requestedStateTokens, safeMaxStateTokens);
+
+  const pinnedToolUseIds = options.pinnedToolUseIds
+    ? options.pinnedToolUseIds instanceof Set
+      ? options.pinnedToolUseIds
+      : new Set(options.pinnedToolUseIds)
+    : undefined;
+
   return {
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
-    keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
+    keepThreshold: clamp01(finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold)),
     preserveRecentMessages: Math.max(
       0,
       Math.floor(
         finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
       ),
     ),
-    maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
-      1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
-    ),
+    maxStateTokens,
+    maxRequestTokens,
     truncateHeadChars: Math.max(
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    maxConcurrentRequests: Math.max(
+      1,
+      Math.floor(
+        finite(options.maxConcurrentRequests, DEFAULT_OPTIONS.maxConcurrentRequests),
+      ),
+    ),
+    requestTimeoutMs: Math.max(
+      1,
+      finite(options.requestTimeoutMs, DEFAULT_OPTIONS.requestTimeoutMs),
+    ),
+    ...(pinnedToolUseIds ? { pinnedToolUseIds } : {}),
   };
 }
 
@@ -99,11 +138,16 @@ export function batchCalls(
 }
 
 export function decideCall(
-  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
+  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'> & { tool_use_id?: string },
   answer: CallAnswer,
   options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
 ): CallDecision {
-  const base = { id: call.id, tool: call.tool, ...answer };
+  const base = {
+    id: call.id,
+    tool: call.tool,
+    ...(call.tool_use_id ? { tool_use_id: call.tool_use_id } : {}),
+    ...answer,
+  };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
   if (answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
@@ -133,11 +177,13 @@ async function askBatch(
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  const removed = Math.max(0, text.length - headChars);
+  const replacement = `${head}[fast-jev-compaction truncated ${removed} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
+  if (headChars === 0) return replacement;
+  return replacement.length < text.length ? replacement : text;
 }
 
 /**
@@ -247,6 +293,94 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
   return decisions.filter((decision) => decision.reason === reason).length;
 }
 
+export function resultFromDecisions(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  decisions: readonly CallDecision[],
+  truncateHeadChars: number,
+  inherited: Pick<
+    CompactResult['stats'],
+    'stateTokens' | 'stateStage' | 'requests' | 'ms'
+  >,
+): CompactResult {
+  const charsBefore = messages.reduce(
+    (sum, message) => sum + messageChars(message),
+    0,
+  );
+  const kept = applyDecisions(
+    messages,
+    decisions,
+    calls,
+    truncateHeadChars,
+  );
+
+  const originalResults = new Map<string, string>();
+  for (const m of messages) {
+    for (const r of m.toolResults ?? []) originalResults.set(r.tool_use_id, r.text);
+    for (const t of m.toolUses) if (t.text !== undefined) originalResults.set(t.tool_use_id, t.text);
+  }
+  const keptResults = new Map<string, string>();
+  for (const m of kept) {
+    for (const r of m.toolResults ?? []) keptResults.set(r.tool_use_id, r.text);
+    for (const t of m.toolUses) if (t.text !== undefined) keptResults.set(t.tool_use_id, t.text);
+  }
+  let resultsTruncated = 0;
+  for (const [id, originalText] of originalResults) {
+    const keptText = keptResults.get(id);
+    if (keptText !== undefined && keptText !== originalText) {
+      resultsTruncated++;
+    }
+  }
+
+  const resultsMarkedStale = count(decisions, 'result_dropped');
+
+  return {
+    messages: kept,
+    decisions: [...decisions],
+    stats: {
+      messagesBefore: messages.length,
+      messagesAfter: kept.length,
+      charsBefore,
+      charsAfter: kept.reduce(
+        (sum, message) => sum + messageChars(message),
+        0,
+      ),
+      calls: calls.length,
+      kept: count(decisions, 'kept'),
+      resultsDropped: resultsMarkedStale,
+      resultsTruncated,
+      resultsMarkedStale,
+      callsDropped: count(decisions, 'call_dropped'),
+      pinned: count(decisions, 'pinned'),
+      ...inherited,
+    },
+  };
+}
+
+/**
+ * Maps items asynchronously with bounded concurrency.
+ */
+export async function mapConcurrent<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await fn(items[index]!);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 /**
  * Compacts a transcript by asking Jev, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
@@ -261,9 +395,12 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
-  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
+  const calls = collectToolCalls(
+    messages,
+    resolved.preserveRecentMessages,
+    resolved.pinnedToolUseIds,
+  );
   const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -272,8 +409,10 @@ export async function compact(
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+    const answered = await mapConcurrent(
+      batches,
+      resolved.maxConcurrentRequests,
+      (batch) => askBatch(asker, state.state, batch),
     );
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
@@ -281,29 +420,16 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
-  const kept = applyDecisions(
+  return resultFromDecisions(
     messages,
-    decisions,
     calls,
-    resolved.truncateHeadChars,
-  );
-  return {
-    messages: kept,
     decisions,
-    stats: {
-      messagesBefore: messages.length,
-      messagesAfter: kept.length,
-      charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
-      calls: calls.length,
-      kept: count(decisions, 'kept'),
-      resultsDropped: count(decisions, 'result_dropped'),
-      callsDropped: count(decisions, 'call_dropped'),
-      pinned: count(decisions, 'pinned'),
+    resolved.truncateHeadChars,
+    {
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
       ms: Date.now() - started,
     },
-  };
+  );
 }

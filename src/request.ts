@@ -53,28 +53,51 @@ export function parseJevResponse(
   if (
     parsed === null ||
     typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
     !('answers' in parsed) ||
     parsed.answers === null ||
-    typeof parsed.answers !== 'object'
+    typeof parsed.answers !== 'object' ||
+    Array.isArray(parsed.answers)
   ) {
     throw new Error('Jev response is missing answers');
   }
   return parsed as JevResponse;
 }
 
-/** The `noul` probability of one answer; throws when it is not there. */
+/** The `noul` probability of one answer; throws when it is missing or outside [0, 1]. */
 export function noulAnswer(
   answers: Record<string, JevAnswer>,
   name: string,
 ): number {
+  if (!(name in answers)) {
+    throw new Error(`Invalid Jev answer for ${name}`);
+  }
   const answer = answers[name];
   if (
     !answer ||
+    typeof answer !== 'object' ||
     !('noul' in answer) ||
     typeof answer.noul !== 'number' ||
-    !Number.isFinite(answer.noul)
+    !Number.isFinite(answer.noul) ||
+    answer.noul < 0 ||
+    answer.noul > 1
   ) {
     throw new Error(`Invalid Jev answer for ${name}`);
   }
   return answer.noul;
+}
+
+/** Validates that all questions have matching, valid answers. */
+export function validateAnswers(
+  questions: JevQuestions,
+  answers: Record<string, JevAnswer>,
+): void {
+  for (const name of Object.keys(questions)) {
+    const q = questions[name];
+    if (q?.type === 'noul') {
+      noulAnswer(answers, name);
+    } else if (!(name in answers)) {
+      throw new Error(`Jev response missing answer for ${name}`);
+    }
+  }
 }

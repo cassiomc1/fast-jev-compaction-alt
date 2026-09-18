@@ -59,12 +59,12 @@ fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
 ## Install and usage
 
 ```sh
-npm install fast-jev-compaction
+npm install fast-jev-compaction-alt
 export TYPESAFE_API_KEY=...
 ```
 
 ```ts
-import { compactMessages, reductionRatio, type Message } from 'fast-jev-compaction';
+import { compactMessages, reductionRatio, type Message } from 'fast-jev-compaction-alt';
 
 const transcript: Message[] = [
   { role: 'user', text: 'Fix the failing test. Never edit src/generated.', toolUses: [] },
@@ -110,6 +110,8 @@ put it in a source file.
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `maxConcurrentRequests` | `3` | Maximum concurrent HTTP requests to Jev when asking question batches |
+| `requestTimeoutMs` | `15000` | HTTP request timeout in milliseconds before aborting a Jev request |
 
 `result.stats` reports message and character counts before and after, the
 per-reason decision counts, the state size in estimated tokens, which fitting
@@ -146,15 +148,15 @@ Then add this repository as a plugin marketplace and install the plugin,
 either from the shell or as slash commands inside a session:
 
 ```sh
-claude plugin marketplace add tamaratran/fast-jev-compaction
-claude plugin install fast-jev-compaction@fast-jev-compaction
+claude plugin marketplace add cassiomc1/fast-jev-compaction-alt
+claude plugin install fast-jev-compaction-alt@fast-jev-compaction-alt
 ```
 
 The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
 …); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
 auto-compaction) goes through Jev: the toast reads
-`fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
+`fast-jev-compaction-alt: kept N/M messages, no summary (…)` when the pruned history
 replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
 could not remove enough (short sessions, or when it fails).
 
@@ -165,7 +167,7 @@ just the repo's `.claude-plugin/marketplace.json`.
 ## OpenCode plugin
 
 The same library ships as an OpenCode plugin (`src/plugin.ts`, exported as
-`fast-jev-compaction/plugin` and `./server`). OpenCode has no
+`fast-jev-compaction-alt/plugin` and `./server`). OpenCode has no
 replace-the-transcript hook, so the port works with the two hooks OpenCode
 does offer:
 
@@ -182,14 +184,14 @@ does offer:
 ### Install in OpenCode
 
 ```sh
-npm install fast-jev-compaction
+npm install fast-jev-compaction-alt
 export TYPESAFE_API_KEY=...
 ```
 
 `opencode.json`:
 
 ```json
-{ "$schema": "https://opencode.ai/config.json", "plugin": ["fast-jev-compaction"] }
+{ "$schema": "https://opencode.ai/config.json", "plugin": ["fast-jev-compaction-alt"] }
 ```
 
 With options (every value also falls back to its default when omitted):
@@ -197,20 +199,22 @@ With options (every value also falls back to its default when omitted):
 ```json
 {
   "plugin": [
-    ["fast-jev-compaction", { "keepThreshold": 0.5, "preserveRecentMessages": 6 }]
+    ["fast-jev-compaction-alt", { "keepThreshold": 0.5, "preserveRecentMessages": 6 }]
   ]
 }
 ```
 
 `apiKey` defaults to `process.env.TYPESAFE_API_KEY`. All library options
 (`goal`, `keepThreshold`, `preserveRecentMessages`, `maxStateTokens`,
-`maxRequestTokens`, `truncateHeadChars`, plus `model`/`baseUrl`) behave as
+`maxRequestTokens`, `truncateHeadChars`, `maxConcurrentRequests`, `requestTimeoutMs`, plus `model`/`baseUrl`) behave as
 documented above.
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `enabled` | `true` | Set to `false` to keep the plugin loaded but skip Jev pruning |
 | `minReductionRatio` | `0` | Minimum estimated char reduction required to apply pruning to a request |
+| `maxConcurrentRequests` | `3` | Maximum concurrent HTTP requests to Jev across question batches |
+| `requestTimeoutMs` | `15000` | Timeout in milliseconds for Jev API requests before falling back gracefully |
 | `debugFile` | `FAST_JEV_DEBUG_FILE` | Path of a JSONL file receiving one stats-only line per hook invocation (counts and decisions, never message content); proves the plugin is firing and pruning in a live session |
 
 Failures (missing key, Jev error, oversized history) are logged with

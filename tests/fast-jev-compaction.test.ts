@@ -13,12 +13,14 @@ import {
   parseJevResponse,
   reductionRatio,
   resolveOptions,
+  resultFromDecisions,
   type HistoryToolCall,
   type JevAsker,
   type JevQuestions,
   type Message,
   type ToolCall,
 } from '../src/index.js';
+import { decisionSummary } from '../src/opencode.js';
 
 function message(role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
   return { role, text, toolUses: [], ...extra };
@@ -89,6 +91,31 @@ describe('options', () => {
       preserveRecentMessages: 2,
       truncateHeadChars: 0,
     });
+    expect(resolveOptions({ keepThreshold: -0.5 }).keepThreshold).toBe(0);
+    expect(resolveOptions({ keepThreshold: 1.8 }).keepThreshold).toBe(1);
+    expect(() => resolveOptions({ maxRequestTokens: 10 })).toThrow(/maxRequestTokens must be at least/);
+
+    // Finding 1 regression tests:
+    const calls = collectToolCalls(transcript(), 0);
+
+    // 1. maxRequestTokens: 1000 clamps maxStateTokens to safe budget (1000 - 20 - 150 = 830)
+    const optReq1000 = resolveOptions({ maxRequestTokens: 1000 });
+    expect(optReq1000.maxRequestTokens).toBe(1000);
+    expect(optReq1000.maxStateTokens).toBe(830);
+    expect(() => batchCalls([calls[0]!], optReq1000.maxStateTokens, optReq1000)).not.toThrow();
+    expect(batchCalls([calls[0]!], optReq1000.maxStateTokens, optReq1000).length).toBeGreaterThanOrEqual(1);
+
+    // 2. maxStateTokens: 1000 with default maxRequestTokens (30,000)
+    const optState1000 = resolveOptions({ maxStateTokens: 1000 });
+    expect(optState1000.maxStateTokens).toBe(1000);
+    expect(optState1000.maxRequestTokens).toBe(30_000);
+    expect(() => batchCalls([calls[0]!], optState1000.maxStateTokens, optState1000)).not.toThrow();
+
+    // 3. maxStateTokens: 950, maxRequestTokens: 1000 clamps maxStateTokens safely to 830
+    const opt950_1000 = resolveOptions({ maxStateTokens: 950, maxRequestTokens: 1000 });
+    expect(opt950_1000.maxRequestTokens).toBe(1000);
+    expect(opt950_1000.maxStateTokens).toBe(830);
+    expect(() => batchCalls([calls[0]!], opt950_1000.maxStateTokens, opt950_1000)).not.toThrow();
   });
 });
 
@@ -224,6 +251,16 @@ describe('state fitting', () => {
     const messages = [message('user', 'a'.repeat(2000)), message('assistant', 'b')];
     expect(() => fitState(messages, [], { ...fit, maxStateTokens: 50 })).toThrow(/too large/);
   });
+
+  it('includes observability counts in FittedState stats', () => {
+    const state = fitState(transcript(), collectToolCalls(transcript(), 0), fit);
+    expect(state.stats).toBeDefined();
+    expect(typeof state.stats?.abridgedMessages).toBe('number');
+    expect(typeof state.stats?.collapsedMessages).toBe('number');
+    expect(typeof state.stats?.compactedCalls).toBe('number');
+    expect(typeof state.stats?.omittedMessages).toBe('number');
+    expect(typeof state.stats?.mergedRuns).toBe('number');
+  });
 });
 
 describe('question batching', () => {
@@ -330,6 +367,85 @@ describe('decisions', () => {
       `[fast-jev-compaction truncated ${total} chars of this tool result; re-run the tool if needed]`,
     );
   });
+
+  it('strictly keeps only note when truncateHeadChars is 0 even for short strings', () => {
+    const messages = [
+      message('user', 'initial prompt'),
+      message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+      message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'short output' }] }),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+    const out = applyDecisions(messages, decisions, calls, 0);
+    expect(out[2]?.toolResults?.[0]?.text).toBe(
+      '[fast-jev-compaction truncated 12 chars of this tool result; re-run the tool if needed]',
+    );
+  });
+
+  it('does not report a truncation when output was left unchanged (replacement would be larger)', () => {
+    const messages = [
+      message('user', 'initial prompt'),
+      message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+      message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'short' }] }),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+    const out = applyDecisions(messages, decisions, calls, 50);
+    expect(out[2]?.toolResults?.[0]?.text).toBe('short');
+  });
+
+  describe('resultFromDecisions and decisionSummary mutation tracking (Finding 6)', () => {
+    const inherited = { stateTokens: 100, stateStage: 'full', requests: 1, ms: 10 };
+
+    it('Case A: does not count short results as truncated when left unchanged', () => {
+      const messages = [
+        message('user', 'initial prompt'),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'short' }] }),
+      ];
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+      const res = resultFromDecisions(messages, calls, decisions, 50, inherited);
+      expect(res.stats.resultsTruncated).toBe(0);
+      expect(res.stats.resultsMarkedStale).toBe(1);
+      expect(res.stats.resultsDropped).toBe(1);
+      expect(decisionSummary(res)).not.toMatch(/results truncated/);
+    });
+
+    it('Case B: counts long results as truncated when actually modified', () => {
+      const messages = [
+        message('user', 'initial prompt'),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'long '.repeat(100) }] }),
+      ];
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 })];
+      const res = resultFromDecisions(messages, calls, decisions, 50, inherited);
+      expect(res.stats.resultsTruncated).toBe(1);
+      expect(res.stats.resultsMarkedStale).toBe(1);
+      expect(decisionSummary(res)).toMatch(/1 results truncated/);
+    });
+
+    it('Case C: counts only actually modified results in mixed transcripts (1 short + 1 long -> 1)', () => {
+      const messages = [
+        message('user', 'initial prompt'),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-1', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-1', text: 'short' }] }),
+        message('assistant', '', { toolUses: [{ tool_use_id: 'call-2', tool: 'Read', input: {} }] }),
+        message('user', '', { toolResults: [{ tool_use_id: 'call-2', text: 'long '.repeat(100) }] }),
+      ];
+      const calls = collectToolCalls(messages, 0);
+      const decisions = [
+        decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
+        decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
+      ];
+      const res = resultFromDecisions(messages, calls, decisions, 50, inherited);
+      expect(res.stats.resultsTruncated).toBe(1);
+      expect(res.stats.resultsMarkedStale).toBe(2);
+      expect(res.stats.resultsDropped).toBe(2);
+      expect(decisionSummary(res)).toMatch(/1 results truncated/);
+    });
+  });
 });
 
 describe('compact', () => {
@@ -387,6 +503,51 @@ describe('compact', () => {
       /Invalid Jev answer/,
     );
   });
+
+  it('rejects Jev probabilities outside [0, 1]', async () => {
+    const brokenNegative: JevAsker = {
+      ask: async () => ({ answers: { call_t1: { noul: -0.1 }, result_t1: { noul: 0.5 } } }),
+    };
+    await expect(compact(transcript(), brokenNegative, { preserveRecentMessages: 1 })).rejects.toThrow(
+      /Invalid Jev answer/,
+    );
+
+    const brokenAboveOne: JevAsker = {
+      ask: async () => ({ answers: { call_t1: { noul: 1.5 }, result_t1: { noul: 0.5 } } }),
+    };
+    await expect(compact(transcript(), brokenAboveOne, { preserveRecentMessages: 1 })).rejects.toThrow(
+      /Invalid Jev answer/,
+    );
+  });
+
+  it('bounds request concurrency across batches', async () => {
+    let currentConcurrency = 0;
+    let maxObservedConcurrency = 0;
+    const trackingAsker: JevAsker = {
+      async ask(_state, questions) {
+        currentConcurrency++;
+        maxObservedConcurrency = Math.max(maxObservedConcurrency, currentConcurrency);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        currentConcurrency--;
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 0.9 }]),
+          ),
+        };
+      },
+    };
+    const messages = transcript();
+    const calls = collectToolCalls(messages, 0);
+    const stateTokens = fitState(messages, calls, { ...fit, maxStateTokens: 500 }).tokens;
+    await compact(messages, trackingAsker, {
+      preserveRecentMessages: 0,
+      maxStateTokens: stateTokens,
+      maxRequestTokens: stateTokens + 150,
+      maxConcurrentRequests: 2,
+    });
+    expect(maxObservedConcurrency).toBeGreaterThan(0);
+    expect(maxObservedConcurrency).toBeLessThanOrEqual(2);
+  });
 });
 
 describe('HTTP client', () => {
@@ -429,5 +590,20 @@ describe('HTTP client', () => {
     await expect(
       compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
     ).rejects.toThrow(/TYPESAFE_API_KEY/);
+  });
+
+  it('times out and aborts long-running requests', async () => {
+    const delayedClient = new JevClient({
+      apiKey: 'k',
+      requestTimeoutMs: 20,
+      fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new Error('Request aborted'));
+          });
+        });
+      }) as typeof fetch,
+    });
+    await expect(delayedClient.ask('s', { q: { type: 'noul', instructions: 'x' } })).rejects.toThrow();
   });
 });
