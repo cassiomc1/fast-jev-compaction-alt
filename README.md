@@ -1,4 +1,4 @@
-# fast-jev-compaction
+# fast-jev-compaction-alt
 
 Claude Code plugin that replaces the compaction summary with Jev decisions:
 every tool call and result is scored in one fast request, stale ones are
@@ -161,6 +161,75 @@ could not remove enough (short sessions, or when it fails).
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
+
+## OpenCode plugin
+
+The same library ships as an OpenCode plugin (`src/plugin.ts`, exported as
+`fast-jev-compaction/plugin` and `./server`). OpenCode has no
+replace-the-transcript hook, so the port works with the two hooks OpenCode
+does offer:
+
+- `experimental.chat.messages.transform` runs the library over the messages of
+  **every LLM request** (normal prompts and compactions alike) and drops or
+  truncates the tool outputs Jev judges stale. The stored session is never
+  rewritten; only the in-memory copy sent to the model is pruned, so every
+  request pays only for the context that still matters. This is the continuous
+  verbatim compaction, with no summary anywhere.
+- `experimental.session.compacting` injects Jev's keep/drop lists into the
+  built-in compaction prompt, so when OpenCode does summarise, the summary
+  preserves what Jev scored as still needed.
+
+### Install in OpenCode
+
+```sh
+npm install fast-jev-compaction
+export TYPESAFE_API_KEY=...
+```
+
+`opencode.json`:
+
+```json
+{ "$schema": "https://opencode.ai/config.json", "plugin": ["fast-jev-compaction"] }
+```
+
+With options (every value also falls back to its default when omitted):
+
+```json
+{
+  "plugin": [
+    ["fast-jev-compaction", { "keepThreshold": 0.5, "preserveRecentMessages": 6 }]
+  ]
+}
+```
+
+`apiKey` defaults to `process.env.TYPESAFE_API_KEY`. All library options
+(`goal`, `keepThreshold`, `preserveRecentMessages`, `maxStateTokens`,
+`maxRequestTokens`, `truncateHeadChars`, plus `model`/`baseUrl`) behave as
+documented above.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enabled` | `true` | Set to `false` to keep the plugin loaded but skip Jev pruning |
+| `minReductionRatio` | `0` | Minimum estimated char reduction required to apply pruning to a request |
+| `debugFile` | `FAST_JEV_DEBUG_FILE` | Path of a JSONL file receiving one stats-only line per hook invocation (counts and decisions, never message content); proves the plugin is firing and pruning in a live session |
+
+Failures (missing key, Jev error, oversized history) are logged with
+`client.app.log` and leave the messages untouched, so the session always keeps
+working. A rejected key (401/403) disables Jev pruning until OpenCode reloads,
+so a bad key costs one failed request instead of one per model call. The
+per-request pruning decisions are logged at `info` level when something was
+dropped.
+
+### OpenCode notes and limits
+
+- Pruning applies to the payload sent to the model, not to the stored
+  session: reopening the transcript still shows the original tool outputs.
+- The transform hook fires on every request, so Jev is asked once per model
+  call while tool history keeps changing (no candidates → no request, no cost).
+- Contributors: the runtime only honours **in-place** mutation of
+  `output.messages` (`splice`), never reassignment; `src/opencode.ts`
+  (`applyDecisionsToOpenCode`) already handles this.
+- See [`opencode.example.json`](opencode.example.json) for a starter config.
 
 ## Development
 

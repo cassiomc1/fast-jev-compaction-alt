@@ -1,5 +1,5 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "fast-jev-compaction-alt",
   "version": "0.2.0",
   "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
   "type": "module",
@@ -11,6 +11,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    },
+    "./server": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    },
+    "./opencode": {
+      "types": "./dist/opencode.d.ts",
+      "import": "./dist/opencode.js"
     }
   },
   "files": [
@@ -27,9 +39,28 @@
     "validate:plugin": "claude plugin validate .claude-plugin/plugin.json"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.31",
+    "@opencode-ai/sdk": "^1.18.31",
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
-  }
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "claude-code",
+    "compaction",
+    "context-management",
+    "typesafe",
+    "jev"
+  ]
 }
