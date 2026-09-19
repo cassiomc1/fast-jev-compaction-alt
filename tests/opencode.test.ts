@@ -112,6 +112,24 @@ describe('resolveOpenCodeConfig', () => {
     expect(config.maxConcurrentRequests).toBe(5);
     expect(config.requestTimeoutMs).toBe(8000);
   });
+
+  it('normalises hostile JSON option values instead of letting them reach runtime', () => {
+    const config = resolveOpenCodeConfig(
+      {
+        enabled: 'false' as unknown as boolean,
+        maxStateTokens: 12.9,
+        toolWeights: {
+          Bash: null as unknown as { callBias: number },
+          Shell: { callBias: 99, resultBias: -99 },
+        },
+      },
+      {},
+    );
+    expect(config.enabled).toBe(true);
+    expect(config.maxStateTokens).toBe(12);
+    expect(config.toolWeights.bash).toEqual({ callBias: 0, resultBias: 0 });
+    expect(config.toolWeights.shell).toEqual({ callBias: 1, resultBias: -1 });
+  });
 });
 
 describe('openCodeToMessages', () => {

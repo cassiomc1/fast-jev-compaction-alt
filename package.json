@@ -32,6 +32,10 @@
     "./opencode": {
       "types": "./dist/opencode.d.ts",
       "import": "./dist/opencode.js"
+    },
+    "./codex": {
+      "types": "./dist/codex.d.ts",
+      "import": "./dist/codex.js"
     }
   },
   "files": [
@@ -43,6 +47,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit && npm run typecheck:hooks",
     "test": "vitest run",
+    "test:programming": "vitest run tests/programming-workflows.test.ts",
     "demo": "tsx examples/demo.ts",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
     "validate:manifests": "node scripts/validate-manifests.mjs",

@@ -1,4 +1,13 @@
-import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
+import type {
+  ChoiceAnswer,
+  JevAnswer,
+  JevQuestion,
+  JevQuestions,
+  JevResponse,
+  JevState,
+  NoulAnswer,
+  ScoreAnswer,
+} from './types.js';
 
 export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
 export const DEFAULT_MODEL = 'jev-latest';
@@ -26,6 +35,7 @@ export function buildJevRequest(
     headers: {
       authorization: `Bearer ${params.apiKey}`,
       'content-type': 'application/json',
+      accept: 'application/json',
     },
     body: JSON.stringify({
       model: params.model ?? DEFAULT_MODEL,
@@ -69,35 +79,117 @@ export function noulAnswer(
   answers: Record<string, JevAnswer>,
   name: string,
 ): number {
-  if (!(name in answers)) {
+  if (!hasOwn(answers, name)) {
     throw new Error(`Invalid Jev answer for ${name}`);
   }
   const answer = answers[name];
+  const value = answer && typeof answer === 'object'
+    ? (answer as unknown as Record<string, unknown>).noul
+    : undefined;
   if (
     !answer ||
     typeof answer !== 'object' ||
-    !('noul' in answer) ||
-    typeof answer.noul !== 'number' ||
-    !Number.isFinite(answer.noul) ||
-    answer.noul < 0 ||
-    answer.noul > 1
+    !hasOwn(answer, 'noul') ||
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > 1
   ) {
     throw new Error(`Invalid Jev answer for ${name}`);
   }
-  return answer.noul;
+  return value;
 }
 
-/** Validates that all questions have matching, valid answers. */
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function probability(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`Invalid Jev probability for ${label}`);
+  }
+  return value;
+}
+
+function validateProbabilityMap(value: unknown, label: string): Record<string, number> {
+  if (!isRecord(value)) throw new Error(`Invalid Jev probabilities for ${label}`);
+  for (const [key, probabilityValue] of Object.entries(value)) {
+    probability(probabilityValue, `${label}.${key}`);
+  }
+  return value as Record<string, number>;
+}
+
+function validateChoiceAnswer(
+  question: Extract<JevQuestion, { type: 'choice' }>,
+  answer: unknown,
+  name: string,
+): asserts answer is ChoiceAnswer {
+  if (!isRecord(answer) || typeof answer.choice !== 'string' || !hasOwn(question.criteria, answer.choice)) {
+    throw new Error(`Invalid Jev choice answer for ${name}`);
+  }
+  probability(answer.confidence, `${name}.confidence`);
+  validateProbabilityMap(answer.probabilities, name);
+}
+
+function validateScoreAnswer(
+  answer: unknown,
+  name: string,
+): asserts answer is ScoreAnswer {
+  if (!isRecord(answer) || typeof answer.score !== 'number' || !Number.isFinite(answer.score)) {
+    throw new Error(`Invalid Jev score answer for ${name}`);
+  }
+  probability(answer.confidence, `${name}.confidence`);
+  validateProbabilityMap(answer.probabilities, name);
+}
+
+/** Validates one answer against its question, including confidence fields. */
+export function validateAnswer(
+  question: JevQuestion,
+  answer: unknown,
+  name: string,
+): asserts answer is JevAnswer {
+  if (!isRecord(answer)) throw new Error(`Invalid Jev answer for ${name}`);
+  if (answer.type !== undefined && answer.type !== question.type) {
+    throw new Error(`Invalid Jev answer type for ${name}`);
+  }
+  if (question.type === 'noul') {
+    if (!hasOwn(answer, 'noul')) throw new Error(`Invalid Jev answer for ${name}`);
+    probability(answer.noul, name);
+    return;
+  }
+  if (question.type === 'choice') {
+    validateChoiceAnswer(question, answer, name);
+    return;
+  }
+  validateScoreAnswer(answer, name);
+}
+
+/** Validates that all questions have matching, well-formed answers. */
 export function validateAnswers(
   questions: JevQuestions,
   answers: Record<string, JevAnswer>,
 ): void {
+  if (!isRecord(answers)) throw new Error('Jev response answers must be an object');
   for (const name of Object.keys(questions)) {
     const q = questions[name];
-    if (q?.type === 'noul') {
-      noulAnswer(answers, name);
-    } else if (!(name in answers)) {
+    if (!q || !hasOwn(answers, name)) {
       throw new Error(`Jev response missing answer for ${name}`);
     }
+    validateAnswer(q, answers[name], name);
   }
+}
+
+/** Runs a generic, validated Jev query for routers, triage, or policy code. */
+export async function askQuestions(
+  asker: { ask(state: JevState, questions: JevQuestions): Promise<JevResponse> },
+  state: JevState,
+  questions: JevQuestions,
+): Promise<JevResponse> {
+  const response = await asker.ask(state, questions);
+  validateAnswers(questions, response.answers);
+  return response;
 }

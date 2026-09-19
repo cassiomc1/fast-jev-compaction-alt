@@ -1,9 +1,9 @@
 # fast-jev-compaction-alt
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+Jev-guided, verbatim context compaction for coding agents. The package ships
+with Claude Code and OpenCode integrations, a structural Responses/Codex
+adapter, and a host-neutral npm API. Every tool call and result is scored,
+stale history is dropped or truncated, and everything kept stays verbatim.
 
 ## What and why
 
@@ -14,9 +14,11 @@ calls and tool results Jev says are no longer needed, and it asks Jev while
 showing it the whole conversation. User and assistant text stays verbatim and
 in order.
 
-The repository is both an npm package (`src/`) and a Claude Code plugin
-(`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
-built-in compaction summary with the original messages.
+The repository is both an npm package (`src/`) and a set of host adapters. It
+supports Claude Code (`hooks/`), OpenCode (`src/plugin.ts`), and structural
+Responses/Codex items (`src/codex.ts`) without requiring a Codex/OpenAI SDK.
+The Claude Code adapter uses the package to replace Claude Code's built-in
+compaction summary with the original messages.
 
 ## How it works
 
@@ -56,6 +58,27 @@ built-in compaction summary with the original messages.
 Jev failures, malformed answers, a missing key, or a history that cannot be
 fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
 
+## Programming workflows
+
+The default behavior is designed for repository work:
+
+- User constraints and conversational text remain verbatim.
+- Recent messages and the first message are pinned by default.
+- Tool calls and tool results are decided independently, so a useful command
+  can remain visible even when its large output is truncated.
+- Failed test output can be kept verbatim by the Jev decision or by a host
+  policy; callers should still keep their normal test and approval gates.
+- Large histories are reduced in stages and never exceed the configured Jev
+  state budget, unless compaction fails and the host fallback takes over.
+
+The programming-focused regression suite covers read/grep/edit/test flows,
+exact assertion failures, stale history removal, large coding transcripts, and
+bounded concurrent Jev batches:
+
+```sh
+npm run test:programming
+```
+
 ## Install and usage
 
 ```sh
@@ -87,11 +110,49 @@ if (reductionRatio(result) < 0.25) {
 `Message` is a subset of Claude Code's `SessionMessage`, so a session transcript
 can be passed in as is.
 
+### Responses/Codex items
+
+The package also exposes a dependency-free adapter for Responses-style
+`function_call` and `function_call_output` items:
+
+```ts
+import {
+  applyDecisionsToCodex,
+  codexToMessages,
+  compactCodexItems,
+  type CodexItem,
+} from 'fast-jev-compaction-alt/codex';
+import { collectToolCalls } from 'fast-jev-compaction-alt';
+import type { JevAsker } from 'fast-jev-compaction-alt';
+
+const items: CodexItem[] = /* items from a Responses/Codex request */ [];
+declare const asker: JevAsker;
+const result = await compactCodexItems(items, asker, { preserveRecentMessages: 6 });
+const calls = collectToolCalls(codexToMessages(items), 6);
+const nextItems = applyDecisionsToCodex(items, result.decisions, calls, 300);
+```
+
+Unknown item types are preserved by the adapter. The returned list is a new
+array, and the original request payload is not mutated; this makes it suitable
+for a Codex/Responses middleware that replaces only the outgoing request.
+
 To bring your own transport, implement `JevAsker` (one `ask(state, questions)`
 method) and call `compact(messages, asker, options)`; `buildJevRequest` and
 `parseJevResponse` give you the HTTP request body and response validation.
 The building blocks (`collectToolCalls`, `fitState`, `batchCalls`,
 `decideCall`, `applyDecisions`) are exported too.
+
+For intent routing, triage, urgency, or risk, use the exported `askQuestions`
+helper with `choice` and `score` questions. Responses are validated before use,
+including selected choices, confidence, probabilities, and finite scores. For
+autonomous actions, apply a local policy with `evaluateAutonomy`; it fails
+closed when confidence, intent, or required risk evidence is not acceptable.
+Jev provides evidence, but the local policy remains the authorization boundary.
+
+The autonomy policy treats risk scores as normalized values from `0` (lowest
+risk) to `1` (highest risk). It requires an explicit allow-list of intents and
+a minimum confidence; if a maximum risk is configured, missing or invalid risk
+evidence is rejected.
 
 `apiKey` defaults to `process.env.TYPESAFE_API_KEY`. Never commit the key or
 put it in a source file.
@@ -241,8 +302,10 @@ dropped.
 npm install
 npm run typecheck        # library + hook
 npm test
+npm run test:programming # coding-agent regression scenarios
 npm run build
 npm run validate:plugin  # claude plugin validate
+npm run release:check    # full local package and manifest gate
 TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run demo
 ```
 
