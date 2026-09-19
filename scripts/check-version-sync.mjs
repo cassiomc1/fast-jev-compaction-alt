@@ -12,6 +12,8 @@ function readJson(rel) {
 
 const pkg = readJson('package.json');
 const plugin = readJson('.claude-plugin/plugin.json');
+const portablePlugin = readJson('plugin.json');
+const codexPlugin = readJson('.codex-plugin/plugin.json');
 const marketplace = readJson('.claude-plugin/marketplace.json');
 
 const marketplacePlugin = marketplace.plugins?.[0];
@@ -24,6 +26,16 @@ if (pkg.name !== 'fast-jev-compaction-alt') {
 
 if (plugin.name !== pkg.name) {
   errors.push(`plugin.json name (${plugin.name}) does not match package.json name (${pkg.name})`);
+}
+
+for (const [label, manifest] of [['plugin.json', portablePlugin], ['.codex-plugin/plugin.json', codexPlugin]]) {
+  if (manifest.name !== pkg.name) {
+    errors.push(`${label} name (${manifest.name}) does not match package.json (${pkg.name})`);
+  }
+  const manifestBaseVersion = typeof manifest.version === 'string' ? manifest.version.split('+', 1)[0] : manifest.version;
+  if (pkg.version !== manifestBaseVersion) {
+    errors.push(`Version mismatch: package.json (${pkg.version}) vs ${label} base version (${manifestBaseVersion})`);
+  }
 }
 
 if (marketplacePlugin?.name !== pkg.name) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Deterministic schema and manifest validation for Claude Code plugin files.
- * Validates .claude-plugin/plugin.json, marketplace.json, and hooks.
+ * Deterministic schema and manifest validation for Claude Code and Codex
+ * plugin files. Validates plugin manifests, marketplaces, skills, and hooks.
  * Runs in CI without requiring the external Claude CLI binary.
  * If the Claude CLI is present, also executes 'claude plugin validate --strict'.
  */
@@ -44,6 +44,34 @@ assert(pluginJson.version === pkg.version, `plugin.json version (${pluginJson.ve
 assert(typeof pluginJson.description === 'string' && pluginJson.description.length > 0, 'plugin.json must have description');
 assert(pluginJson.author, 'plugin.json must have author');
 
+// 3. Validate the portable/Codex manifests and skill entrypoint.
+const portablePluginJson = readJson('plugin.json');
+const codexPluginJson = readJson('.codex-plugin/plugin.json');
+for (const [label, manifest] of [
+  ['plugin.json', portablePluginJson],
+  ['.codex-plugin/plugin.json', codexPluginJson],
+]) {
+  assert(manifest.name === pkg.name, `${label} name (${manifest.name}) must match package.json (${pkg.name})`);
+  const manifestBaseVersion = typeof manifest.version === 'string'
+    ? manifest.version.split('+', 1)[0]
+    : manifest.version;
+  assert(manifestBaseVersion === pkg.version, `${label} base version (${manifestBaseVersion}) must match package.json (${pkg.version})`);
+  assert(typeof manifest.description === 'string' && manifest.description.length > 0, `${label} must have description`);
+}
+assert(typeof portablePluginJson.$schema === 'string', 'plugin.json must declare the Agent Plugins schema');
+assert(codexPluginJson.skills === './skills/', '.codex-plugin/plugin.json must point at ./skills/');
+assert(
+  codexPluginJson.version === pkg.version || /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\+codex\.[a-z0-9-]+$/.test(codexPluginJson.version),
+  `.codex-plugin/plugin.json version must be a semver version with an optional +codex cachebuster, got ${codexPluginJson.version}`,
+);
+const skillPath = resolve(root, 'skills/fast-jev-compaction/SKILL.md');
+assert(existsSync(skillPath), 'skills/fast-jev-compaction/SKILL.md is missing');
+if (existsSync(skillPath)) {
+  const skill = readFileSync(skillPath, 'utf8');
+  assert(/^---\n[\s\S]*?^name:\s*fast-jev-compaction\s*$/m.test(skill), 'Codex skill frontmatter must declare name: fast-jev-compaction');
+  assert(/^description:\s*.+$/m.test(skill), 'Codex skill frontmatter must declare a description');
+}
+
 const ALLOWED_CONFIG_TYPES = new Set(['string', 'number', 'boolean', 'directory', 'file']);
 const DISALLOWED_CONFIG_KEYS = new Set(['minimum', 'maximum']); // Claude Code requires min/max
 
@@ -66,7 +94,7 @@ if (pluginJson.userConfig && typeof pluginJson.userConfig === 'object') {
   errors.push('plugin.json must declare userConfig object');
 }
 
-// 3. Validate marketplace.json
+// 4. Validate marketplace.json
 const marketplace = readJson('.claude-plugin/marketplace.json');
 assert(marketplace.name === pkg.name, `marketplace.json name mismatch: ${marketplace.name}`);
 assert(marketplace.owner?.name === 'cassiomc1', `marketplace.json owner must be cassiomc1`);
@@ -74,7 +102,7 @@ assert(Array.isArray(marketplace.plugins) && marketplace.plugins.length > 0, 'ma
 assert(marketplace.plugins[0].name === pkg.name, `marketplace.json plugin name mismatch: ${marketplace.plugins[0].name}`);
 assert(marketplace.plugins[0].version === pkg.version, `marketplace.json plugin version mismatch: ${marketplace.plugins[0].version}`);
 
-// 4. Validate hooks/hooks.json
+// 5. Validate hooks/hooks.json
 const hooks = readJson('hooks/hooks.json');
 assert(Array.isArray(hooks.modules) && hooks.modules.length > 0, 'hooks.json must declare modules array');
 

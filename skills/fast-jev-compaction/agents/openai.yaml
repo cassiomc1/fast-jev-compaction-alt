@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fast Jev Compaction"
+  short_description: "Route coding work safely with Jev"
+  default_prompt: "Apply Jev-guided context, routing, triage, and fail-closed autonomy checks to this programming task."

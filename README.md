@@ -20,6 +20,54 @@ Responses/Codex items (`src/codex.ts`) without requiring a Codex/OpenAI SDK.
 The Claude Code adapter uses the package to replace Claude Code's built-in
 compaction summary with the original messages.
 
+## Relationship to the original project
+
+This repository is an independently maintained fork and extension of the
+original [`tamaratran/fast-jev-compaction`](https://github.com/tamaratran/fast-jev-compaction)
+project. The original repository is the upstream reference for the Jev-guided
+compaction implementation; this fork preserves that core direction while
+adding the Codex/Responses adapter, OpenCode integration, programming-workflow
+policies, and expanded validation and regression coverage.
+
+Use the original project when you need the upstream Claude Code/npm baseline.
+Use this repository when you need the additional Codex, OpenCode, routing,
+triage, autonomy, and programming-agent safeguards described below.
+
+## Codex plugin
+
+The repository also contains the portable Agent Plugins manifest
+(`plugin.json`), the Codex compatibility manifest (`.codex-plugin/plugin.json`),
+and the `fast-jev-compaction` skill. The skill is designed for coding sessions
+and applies the same rules to intent routing, triage, urgency, risk, autonomy
+thresholds, parallel Jev questions, and Responses/Codex item compaction.
+
+Install it from a local marketplace when using Codex locally. For the default
+personal marketplace, add an entry in `~/.agents/plugins/marketplace.json` and
+then run:
+
+```sh
+codex plugin add fast-jev-compaction-alt@local-fast-jev
+```
+
+For a non-default marketplace, register its marketplace root first with
+`codex plugin marketplace add <marketplace-root>` and use that marketplace's
+name in the install selector.
+
+Then restart the Codex desktop app or start a new Codex process. Enable the
+plugin in the local Codex configuration if the client does not enable newly
+installed local plugins automatically:
+
+```toml
+[plugins."fast-jev-compaction-alt@local-fast-jev"]
+enabled = true
+```
+
+This integration exposes a reusable skill; it does not intercept or rewrite
+Codex's private hidden context window. A host integration must provide a
+Responses-style item list before `compactCodexItems` can compact it. If Jev is
+unavailable, the normal host behavior remains authoritative and the original
+payload should be preserved.
+
 ## How it works
 
 1. Every `tool_use` is paired with its `tool_result` by `tool_use_id`. Calls in
