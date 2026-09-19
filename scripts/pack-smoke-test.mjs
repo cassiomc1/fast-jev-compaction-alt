@@ -32,6 +32,13 @@ for (const rel of requiredDts) {
 }
 console.log('All declaration files verified.');
 
+for (const rel of ['plugin.json', '.codex-plugin/plugin.json', 'skills/fast-jev-compaction/SKILL.md']) {
+  if (!fs.existsSync(path.join(root, rel))) {
+    throw new Error(`Missing Codex plugin asset: ${rel}`);
+  }
+}
+console.log('Codex plugin assets verified.');
+
 // Pack tarball
 console.log('Running npm pack...');
 const tarballName = execSync('npm pack', { cwd: root, encoding: 'utf8' }).trim().split('\n').pop().trim();
@@ -67,6 +74,13 @@ try {
     if (typeof codex.codexToMessages !== 'function') throw new Error('Codex export missing codexToMessages');
     if (typeof root.askQuestions !== 'function') throw new Error('Root export missing askQuestions');
     if (typeof root.evaluateAutonomy !== 'function') throw new Error('Root export missing evaluateAutonomy');
+
+    const fs = await import('node:fs');
+    for (const file of ['plugin.json', '.codex-plugin/plugin.json', 'skills/fast-jev-compaction/SKILL.md']) {
+      if (!fs.existsSync(new URL('node_modules/fast-jev-compaction-alt/' + file, import.meta.url))) {
+        throw new Error('Packed Codex plugin asset missing: ' + file);
+      }
+    }
 
     console.log('All entrypoint imports verified successfully.');
   `;

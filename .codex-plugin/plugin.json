@@ -1,0 +1,38 @@
+{
+  "name": "fast-jev-compaction-alt",
+  "version": "0.2.0+codex.20260919104121",
+  "description": "Jev-guided, verbatim context compaction and fail-closed decision support for coding agents.",
+  "author": {
+    "name": "Cassio Marques Campos",
+    "url": "https://github.com/cassiomc1"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/cassiomc1/fast-jev-compaction-alt",
+  "keywords": [
+    "codex",
+    "context compaction",
+    "jev",
+    "programming",
+    "triage",
+    "autonomy"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Fast Jev Compaction",
+    "shortDescription": "Keep coding context verbatim while routing safely",
+    "longDescription": "Use Jev-guided compaction and fail-closed local policy for coding-agent context, intent routing, triage, risk, autonomy thresholds, and parallel question evaluation.",
+    "developerName": "Cassio Marques Campos",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/cassiomc1/fast-jev-compaction-alt",
+    "defaultPrompt": [
+      "Apply Jev-guided context and autonomy checks to this programming task",
+      "Review this coding workflow for routing, triage, risk, and confidence errors"
+    ],
+    "brandColor": "#6D5EF5",
+    "screenshots": []
+  }
+}

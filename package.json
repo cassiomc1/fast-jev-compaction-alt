@@ -40,6 +40,9 @@
   },
   "files": [
     "dist",
+    "plugin.json",
+    ".codex-plugin",
+    "skills",
     "README.md",
     "LICENSE"
   ],

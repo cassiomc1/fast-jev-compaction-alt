@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "fast-jev-compaction-alt",
+  "version": "0.2.0",
+  "description": "Jev-guided, verbatim context compaction and fail-closed decision support for coding agents.",
+  "author": {
+    "name": "Cassio Marques Campos",
+    "url": "https://github.com/cassiomc1"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/cassiomc1/fast-jev-compaction-alt"
+}
