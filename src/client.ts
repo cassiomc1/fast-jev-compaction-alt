@@ -1,4 +1,4 @@
-import { buildJevRequest, parseJevResponse } from './request.js';
+import { buildJevRequest, parseJevResponse, validateAnswers } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
 export interface JevClientOptions {
@@ -28,12 +28,20 @@ export class JevClient implements JevAsker {
     this.apiKey = options.apiKey ?? process.env.TYPESAFE_API_KEY ?? '';
     this.model = options.model;
     this.baseUrl = options.baseUrl;
-    this.fetcher = options.fetch ?? fetch;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.fetcher = options.fetch ?? globalThis.fetch;
+    this.requestTimeoutMs =
+      typeof options.requestTimeoutMs === 'number' &&
+      Number.isFinite(options.requestTimeoutMs) &&
+      options.requestTimeoutMs > 0
+        ? options.requestTimeoutMs
+        : DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
     if (!this.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+    if (typeof this.fetcher !== 'function') {
+      throw new Error('A fetch implementation is required to call Jev');
+    }
     const request = buildJevRequest(
       { apiKey: this.apiKey, model: this.model, baseUrl: this.baseUrl },
       state,
@@ -51,7 +59,9 @@ export class JevClient implements JevAsker {
         body: request.body,
         signal: controller.signal,
       });
-      return parseJevResponse(response.status, response.ok, await response.text());
+      const parsed = parseJevResponse(response.status, response.ok, await response.text());
+      validateAnswers(questions, parsed.answers);
+      return parsed;
     } finally {
       clearTimeout(timeoutId);
     }

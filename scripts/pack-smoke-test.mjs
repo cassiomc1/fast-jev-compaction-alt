@@ -16,6 +16,7 @@ const requiredDts = [
   'dist/index.d.ts',
   'dist/plugin.d.ts',
   'dist/opencode.d.ts',
+  'dist/codex.d.ts',
   'dist/client.d.ts',
   'dist/compact.d.ts',
   'dist/request.d.ts',
@@ -57,11 +58,15 @@ try {
     import * as plugin from 'fast-jev-compaction-alt/plugin';
     import * as server from 'fast-jev-compaction-alt/server';
     import * as opencode from 'fast-jev-compaction-alt/opencode';
+    import * as codex from 'fast-jev-compaction-alt/codex';
 
     if (typeof root.compact !== 'function') throw new Error('Root export missing compact');
     if (typeof plugin.FastJevCompactionPlugin !== 'function') throw new Error('Plugin export missing FastJevCompactionPlugin');
     if (typeof server.FastJevCompactionPlugin !== 'function') throw new Error('Server export missing FastJevCompactionPlugin');
     if (typeof opencode.openCodeToMessages !== 'function') throw new Error('Opencode export missing openCodeToMessages');
+    if (typeof codex.codexToMessages !== 'function') throw new Error('Codex export missing codexToMessages');
+    if (typeof root.askQuestions !== 'function') throw new Error('Root export missing askQuestions');
+    if (typeof root.evaluateAutonomy !== 'function') throw new Error('Root export missing evaluateAutonomy');
 
     console.log('All entrypoint imports verified successfully.');
   `;

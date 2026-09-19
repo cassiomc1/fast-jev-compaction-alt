@@ -275,7 +275,8 @@ export function messageChars(message: Message): number {
   let total = message.text.length;
   for (const tool of message.toolUses) {
     try {
-      total += JSON.stringify(tool.input).length;
+      const serialized = JSON.stringify(tool.input);
+      total += typeof serialized === 'string' ? serialized.length : 0;
     } catch {
       total += 20;
     }

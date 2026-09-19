@@ -96,9 +96,10 @@ export function collectToolCalls(
 }
 
 function inputText(input: Record<string, unknown>, limit: number): string {
-  let json = '';
+  let json = '{}';
   try {
-    json = JSON.stringify(input);
+    const serialized = JSON.stringify(input);
+    json = typeof serialized === 'string' ? serialized : '{}';
   } catch {
     json = '[unserializable input]';
   }

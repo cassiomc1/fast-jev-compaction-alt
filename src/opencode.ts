@@ -135,18 +135,31 @@ function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
+function finiteBias(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
+}
+
+function normaliseToolWeight(value: unknown): ToolWeightEntry {
+  if (!value || typeof value !== 'object') return { callBias: 0, resultBias: 0 };
+  const entry = value as Record<string, unknown>;
+  return {
+    callBias: finiteBias(entry.callBias),
+    resultBias: finiteBias(entry.resultBias),
+  };
+}
+
 /** Merges default tool weights with user overrides; all keys are lower-cased. */
 function mergeToolWeights(
   defaults: Record<string, ToolWeightEntry>,
   overrides?: Record<string, ToolWeightEntry>,
 ): Record<string, ToolWeightEntry> {
-  const merged: Record<string, ToolWeightEntry> = {};
+  const merged: Record<string, ToolWeightEntry> = Object.create(null) as Record<string, ToolWeightEntry>;
   for (const [key, value] of Object.entries(defaults)) {
-    merged[key.toLowerCase()] = value;
+    merged[key.toLowerCase()] = normaliseToolWeight(value);
   }
   if (overrides) {
     for (const [key, value] of Object.entries(overrides)) {
-      merged[key.toLowerCase()] = value;
+      merged[key.toLowerCase()] = normaliseToolWeight(value);
     }
   }
   return merged;
@@ -157,7 +170,7 @@ export function lookupToolWeight(
   weights: Record<string, ToolWeightEntry>,
   toolName: string,
 ): ToolWeightEntry {
-  return weights[toolName.toLowerCase()] ?? { callBias: 0, resultBias: 0 };
+  return normaliseToolWeight(weights[toolName.toLowerCase()]);
 }
 
 /**
@@ -194,11 +207,11 @@ export function resolveOpenCodeConfig(
     ),
     maxStateTokens: Math.max(
       1,
-      finite(options.maxStateTokens, OPENCODE_DEFAULTS.maxStateTokens),
+      Math.floor(finite(options.maxStateTokens, OPENCODE_DEFAULTS.maxStateTokens)),
     ),
     maxRequestTokens: Math.max(
       1,
-      finite(options.maxRequestTokens, OPENCODE_DEFAULTS.maxRequestTokens),
+      Math.floor(finite(options.maxRequestTokens, OPENCODE_DEFAULTS.maxRequestTokens)),
     ),
     truncateHeadChars: Math.max(
       0,
@@ -227,7 +240,7 @@ export function resolveOpenCodeConfig(
       ),
     ),
     minReductionRatio: clamp01(finite(options.minReductionRatio, OPENCODE_DEFAULTS.minReductionRatio)),
-    enabled: options.enabled ?? OPENCODE_DEFAULTS.enabled,
+    enabled: typeof options.enabled === 'boolean' ? options.enabled : OPENCODE_DEFAULTS.enabled,
     debugFile,
     toolWeights: mergeToolWeights(DEFAULT_TOOL_WEIGHTS, options.toolWeights),
   };

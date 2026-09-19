@@ -9,7 +9,12 @@ import type {
 } from 'claude-code';
 
 import { compact, DEFAULT_OPTIONS, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import {
+  buildJevRequest,
+  DEFAULT_MODEL,
+  parseJevResponse,
+  validateAnswers,
+} from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -112,7 +117,9 @@ export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): Jev
         headers: request.headers,
         body: request.body,
       });
-      return parseJevResponse(response.status, response.ok, response.text);
+      const parsed = parseJevResponse(response.status, response.ok, response.text);
+      validateAnswers(questions, parsed.answers);
+      return parsed;
     },
   };
 }
